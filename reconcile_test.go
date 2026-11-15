@@ -32,6 +32,7 @@ func (f *fixture) moved(id string, when time.Duration) {
 // stale puts one card in a column, moved there long enough ago to be
 // owed work, with a single repo label.
 func (f *fixture) stale(column string) {
+	f.kaneo.tasks["t1"] = map[string]any{"id": "t1", "projectId": "proj", "status": column}
 	f.kaneo.board = boardWith(column, "t1", "T-1", ago(10*time.Hour))
 	f.moved("t1", 5*time.Hour)
 	f.kaneo.labels["t1"] = []string{"repo:testrepo"}
@@ -113,16 +114,17 @@ func TestFreshInProgressCardIsLeftAlone(t *testing.T) {
 	f.wantUntouched()
 }
 
-func TestStaleCardWhoseWorkExistsIsSkipped(t *testing.T) {
+func TestStaleToDoWithExistingPRResumesAuthor(t *testing.T) {
 	f := newFixture(t)
 	f.stale("to-do")
-	// The branch is the raw id, never the ticket id.
 	f.github.prs["TestOwner:fix/t1"] = openPR("abc")
 	s := f.reconcile(false)
-	if len(s.skipped) != 1 || s.skipped[0] != "T-1: work already exists" {
-		t.Errorf("skipped = %v, want the pull request to count as the author having run", s.skipped)
+	if len(s.redispatched) != 1 || len(s.skipped) != 0 {
+		t.Fatalf("rework was stranded: %+v", s)
 	}
-	f.wantNoLaunch()
+	if launches := f.pods.launches(); len(launches) != 1 || launches[0].pod != "claude-session-0" {
+		t.Fatalf("launches=%v", launches)
+	}
 }
 
 func TestStaleCardWithNoWorkIsRedispatched(t *testing.T) {
@@ -195,35 +197,16 @@ func TestUnparseableMoveTimeIsAnError(t *testing.T) {
 	}
 }
 
-func TestInReviewNeedsTheIntegrationStatus(t *testing.T) {
-	for _, tc := range []struct {
-		name             string
-		contexts         []string
-		wantSkipped      int
-		wantRedispatched int
-	}{
-		{name: "NoStatus", wantRedispatched: 1},
-		{name: "UnrelatedStatus", contexts: []string{"ci/build"}, wantRedispatched: 1},
-		{name: "IntegrationStatus", contexts: []string{"ci/build", "nightly/integration"}, wantSkipped: 1},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			f := newFixture(t)
-			f.stale("in-review")
-			f.github.prs["TestOwner:fix/t1"] = openPR("abc")
-			f.github.statuses["abc"] = tc.contexts
-			s := f.reconcile(false)
-			if got := len(s.skipped); got != tc.wantSkipped {
-				t.Errorf("skipped %d cards, want %d: %+v", got, tc.wantSkipped, s)
-			}
-			if got := len(s.redispatched); got != tc.wantRedispatched {
-				t.Errorf("redispatched %d cards, want %d: %+v", got, tc.wantRedispatched, s)
-			}
-			if tc.wantRedispatched == 1 {
-				if l := f.pods.launches(); len(l) != 1 || l[0].pod != "claude-session-2" {
-					t.Errorf("launches = %v, want the test pod", l)
-				}
-			}
-		})
+func TestStaleInReviewResumesWithExistingPR(t *testing.T) {
+	f := newFixture(t)
+	f.stale("in-review")
+	f.github.prs["TestOwner:fix/t1"] = openPR("abc")
+	s := f.reconcile(false)
+	if len(s.redispatched) != 1 || len(s.errors) != 0 {
+		t.Fatalf("sweep = %+v, want review stage resumed", s)
+	}
+	if l := f.pods.launches(); len(l) != 1 || l[0].pod != "claude-session-2" {
+		t.Errorf("launches = %v, want test pod", l)
 	}
 }
 
@@ -235,7 +218,7 @@ func TestMergedPullRequestEndsTheStoryInAnyColumn(t *testing.T) {
 		t.Run(column, func(t *testing.T) {
 			f := newFixture(t)
 			f.stale(column)
-			f.d.repos = nil
+			f.d.repos = map[string][]string{"0": {}, "1": {}, "2": {}}
 			f.github.prs["TestOwner:fix/t1"] = []map[string]any{{"merged_at": "2026-11-01T00:00:00Z", "number": 1, "head": map[string]any{"sha": "abc", "ref": "fix/t1", "repo": map[string]string{"full_name": "TestOwner/testrepo"}}}}
 			f.kaneo.tasks["t1"] = map[string]any{"id": "t1", "projectId": "proj", "status": column, "title": "keep me", "dueDate": nil}
 			s := f.reconcile(false)
@@ -257,25 +240,6 @@ func TestMergeableWithAnUnmergedPullRequestIsRedispatched(t *testing.T) {
 	}
 	if l := f.pods.launches(); len(l) != 1 || l[0].pod != "claude-session-1" {
 		t.Errorf("launches = %v, want the merge pod", l)
-	}
-}
-
-// Every route must say what finished work looks like; a column that has
-// no answer must not be swept as done.
-func TestEveryRouteHasAWorkCheck(t *testing.T) {
-	for column := range routes {
-		t.Run(column, func(t *testing.T) {
-			f := newFixture(t)
-			f.github.prs["TestOwner:fix/t1"] = openPR("abc")
-			if _, err := f.d.workExists(t.Context(), column, "TestOwner/testrepo", "t1"); err != nil {
-				t.Errorf("workExists(%s) = %v", column, err)
-			}
-		})
-	}
-	f := newFixture(t)
-	f.github.prs["TestOwner:fix/t1"] = openPR("abc")
-	if _, err := f.d.workExists(t.Context(), "not-a-route", "TestOwner/testrepo", "t1"); err == nil {
-		t.Error("an unknown column was answered instead of refused")
 	}
 }
 
@@ -335,7 +299,7 @@ func TestSkipReasonsReadTheSameAsTheWebhookLogs(t *testing.T) {
 
 func TestUnreadableBoardIsAnError(t *testing.T) {
 	f := newFixture(t)
-	f.kaneo.board = `{"error":"nope"}`
+	f.kaneo.board = map[string]any{"error": "nope"}
 	if _, err := f.d.reconcile(t.Context(), false); err == nil {
 		t.Error("a board that is not a board was swept without error")
 	}

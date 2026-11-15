@@ -1,30 +1,11 @@
 package main
 
-// The safety net under event dispatch.
-//
-// Event dispatch has no retry. If a webhook fires and the work cannot
-// start - the cluster API is down, the dispatcher is mid-restart, the pod
-// is not ready - nothing ever picks it up again, and the card is left
-// looking exactly like one nobody has touched. That is not hypothetical:
-// CLA-11 was moved to To Do on 3 Nov while two nodes were down, the exec
-// failed, and it sat there for five days.
-//
-// Nothing records "this was dispatched". A dispatch log would be a second
-// source of truth that disagrees with reality - and would have died that
-// night too. So this compares the column against the world instead, using
-// only state that survives a restart: when the card entered its column,
-// and whether the work that column implies actually exists on GitHub.
-//
-// The kaneo-reconcile CronJob posts to /reconcile on a clock; this is what
-// runs then.
+// Reconciliation completes merged cards and retries stale active stages.
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -43,6 +24,20 @@ type sweep struct {
 	errors       []string
 }
 
+type cardOutcome uint8
+
+const (
+	unchanged cardOutcome = iota
+	completed
+	redispatched
+	skipped
+)
+
+type cardResult struct {
+	outcome cardOutcome
+	detail  string
+}
+
 // board is the part of /api/task/tasks/{project} the sweep reads.
 type board struct {
 	Data struct {
@@ -53,31 +48,17 @@ type board struct {
 	} `json:"data"`
 }
 
-// strandedColumn is where the author leaves a card while it works. It
-// moves the card first and works second, deliberately, so a death
-// mid-ticket reads as attempted - which means an author that dies in
-// between leaves In Progress holding a card that no column-watcher
-// retries, because nothing dispatches FROM here. CLA-15 sat there for
-// hours after a four-second crash.
-//
-// The remedy is a hand-back, not a decision: the author's own mode logic
-// is the one authoritative copy of what a card in any state is owed
-// (advance an unreviewed PR, rework a declined one, resume pushed-but-
-// unPRed work, or start fresh), so a stale card here goes back to the
-// author and nothing is decided in this file. An earlier draft advanced
-// PR-carrying cards from here and got the policy wrong for rework and
-// closed-PR cards within one review.
+// The author moves cards to in-progress before working. Retry a stale card
+// there through the author, which owns the resume and rework decisions.
 const strandedColumn = "in-progress"
 
-// sweeps is the stage a swept column is owed, or ok false for an inert
-// one. stranded marks a hand-back to the author after ruling out a
-// merged PR. The author decides how to resume unfinished work.
-func sweeps(column string) (st stage, stranded, ok bool) {
+// sweeps maps active columns to the stage responsible for resuming them.
+func sweeps(column string) (stage, bool) {
 	if column == strandedColumn {
-		return routes[authorColumn], true, true
+		return routes[authorColumn], true
 	}
-	st, ok = routes[column]
-	return st, false, ok
+	st, ok := routes[column]
+	return st, ok
 }
 
 // reconcile is one sweep over the columns that dispatch, plus the one
@@ -90,13 +71,28 @@ func (d *dispatcher) reconcile(ctx context.Context, dryRun bool) (sweep, error) 
 	if err := d.kaneo(ctx, "/task/tasks/"+url.PathEscape(d.project), &b); err != nil {
 		return out, err
 	}
+	if b.Data.Columns == nil {
+		return out, fmt.Errorf("board response is missing data.columns")
+	}
 	for _, col := range b.Data.Columns {
-		if _, _, ok := sweeps(col.Slug); !ok && col.Slug != "needs-human-review" {
+		if _, ok := sweeps(col.Slug); !ok && col.Slug != "needs-human-review" {
 			continue // inert column: nothing was ever owed here
 		}
 		for _, c := range col.Tasks {
 			out.checked++
-			d.reconcileCard(ctx, col.Slug, c, dryRun, &out, b)
+			result, err := d.reconcileCard(ctx, col.Slug, c, dryRun, b)
+			if err != nil {
+				out.errors = append(out.errors, c.name()+": "+err.Error())
+				continue
+			}
+			switch result.outcome {
+			case completed:
+				out.completed = append(out.completed, result.detail)
+			case redispatched:
+				out.redispatched = append(out.redispatched, result.detail)
+			case skipped:
+				out.skipped = append(out.skipped, result.detail)
+			}
 		}
 	}
 	return out, nil
@@ -107,103 +103,82 @@ func (d *dispatcher) reconcile(ctx context.Context, dryRun bool) (sweep, error) 
 // find out lands in errors, never in silence: an error here must not
 // read as "nothing to do", because a card nobody can see is the failure
 // this sweep exists for.
-func (d *dispatcher) reconcileCard(ctx context.Context, column string, c card, dryRun bool, out *sweep, b board) {
-	st, stranded, _ := sweeps(column)
-	fail := func(err error) { out.errors = append(out.errors, c.name()+": "+err.Error()) }
+func (d *dispatcher) reconcileCard(ctx context.Context, column string, c card, dryRun bool, b board) (cardResult, error) {
+	st, _ := sweeps(column)
 
 	if column == "needs-human-review" {
 		st = routes[authorColumn]
 	}
 
-	repo, skip, err := d.repoFor(ctx, c.ID, st)
+	repo, ok, err := d.repoForTask(ctx, c.ID)
 	if err != nil {
-		fail(err)
-		return
+		return cardResult{}, err
 	}
-	if skip != "" {
-		out.skipped = append(out.skipped, c.name()+": "+skip)
-		return
+	if !ok {
+		return cardResult{skipped, c.name() + ": card needs exactly one repo: label"}, nil
 	}
 	pr, err := d.taskPullRequest(ctx, repo, c.ID)
 	if err != nil {
-		fail(err)
-		return
+		return cardResult{}, err
 	}
 	if pr != nil && pr.MergedAt != nil {
 		changed, err := d.completeMergedTask(ctx, c.ID, column, b, dryRun)
 		if err != nil {
-			fail(err)
-			return
+			return cardResult{}, err
 		}
 		if !changed {
-			out.skipped = append(out.skipped, c.name()+": card changed since board snapshot")
-			return
+			return cardResult{skipped, c.name() + ": card changed since board snapshot"}, nil
 		}
 		line := fmt.Sprintf("%s: PR #%d merged; %s -> done", c.name(), pr.Number, column)
 		if dryRun {
 			line += " [dry-run]"
 		}
-		out.completed = append(out.completed, line)
-		return
+		return cardResult{completed, line}, nil
 	}
 	if column == "needs-human-review" {
-		return
+		return cardResult{}, nil
 	}
 
 	since, err := d.enteredColumnAt(ctx, c.ID)
 	if err != nil {
-		fail(err)
-		return
+		return cardResult{}, err
 	}
 	if since.IsZero() {
 		// No recorded move means the card was created straight into this
 		// column and never moved, so no webhook ever fired for it. Treat
 		// creation as the clock.
 		if c.CreatedAt == "" {
-			fail(fmt.Errorf("no recorded move and no createdAt, so nothing dates it"))
-			return
+			return cardResult{}, fmt.Errorf("no recorded move and no createdAt, so nothing dates it")
 		}
 		since, err = time.Parse(time.RFC3339Nano, c.CreatedAt)
 		if err != nil {
-			fail(fmt.Errorf("createdAt %q: %w", c.CreatedAt, err))
-			return
+			return cardResult{}, fmt.Errorf("createdAt %q: %w", c.CreatedAt, err)
 		}
 	}
 	age := time.Since(since)
 	if age < d.stale {
-		return // still within the window a real run could take
+		return cardResult{}, nil // a worker may still be running
 	}
-	if !stranded {
-		exists, err := d.workForPR(ctx, column, repo, pr)
-		if err != nil {
-			fail(err)
-			return
-		}
-		if exists {
-			// The work ran; the card is simply waiting on the next
-			// stage, or on a human. Not ours to restart.
-			out.skipped = append(out.skipped, c.name()+": work already exists")
-			return
-		}
+	// The stage owns resume/rework policy. A PR or integration status may
+	// exist even though its corresponding board transition never happened.
+	if !d.podWorksRepo(st, repo) {
+		return cardResult{skipped, c.name() + ": " + st.pod() + " does not work " + repo}, nil
 	}
 	line := fmt.Sprintf("%s (%s, %dh)", c.name(), column, int(age.Hours()))
 	if dryRun {
-		out.redispatched = append(out.redispatched, line+" [dry-run]")
-		return
+		return cardResult{redispatched, line + " [dry-run]"}, nil
 	}
 	slog.Info("reconcile: stuck card, re-dispatching", "task", c.name(), "column", column, "since", since)
 	// A wake or launch that failed is an error, not a redispatch: the
 	// summary line is what a morning reads, and "redispatched 1" over a
 	// card that never started is worse than silence.
-	if err := d.runStage(ctx, repo, st, c); err != nil {
-		if errors.Is(err, errPodBusy) {
-			out.skipped = append(out.skipped, c.name()+": "+err.Error())
-			return
+	if err := d.runStage(ctx, repo, st, c, column); err != nil {
+		if errors.Is(err, errPodBusy) || errors.Is(err, errCardChanged) {
+			return cardResult{skipped, c.name() + ": " + err.Error()}, nil
 		}
-		fail(err)
-		return
+		return cardResult{}, err
 	}
-	out.redispatched = append(out.redispatched, line)
+	return cardResult{redispatched, line}, nil
 }
 
 // enteredColumnAt is when the card last changed column, or zero when it
@@ -233,63 +208,7 @@ func (d *dispatcher) enteredColumnAt(ctx context.Context, id string) (time.Time,
 	return latest, nil
 }
 
-// workExists asks whether the work this column implies already happened.
-//
-// Asked of GitHub, not of Kaneo: a branch and a commit status survive
-// everything this dispatcher does, and they are what the next stage reads
-// anyway. If the answer is yes, the card is mid-flight and must be left
-// alone - re-dispatching would run a second agent beside a live one.
-func (d *dispatcher) workExists(ctx context.Context, column, repo, id string) (bool, error) {
-	pr, err := d.taskPullRequest(ctx, repo, id)
-	if err != nil {
-		return false, err
-	}
-	return d.workForPR(ctx, column, repo, pr)
-}
-
-func (d *dispatcher) workForPR(ctx context.Context, column, repo string, pr *pullRequest) (bool, error) {
-	if pr == nil {
-		return false, nil
-	}
-	if pr.MergedAt != nil {
-		return true, nil
-	}
-	owner, name, _ := strings.Cut(repo, "/")
-
-	switch column {
-	case authorColumn:
-		// The author's job is to open a pull request. One exists -> it ran.
-		return true, nil
-	case "in-review":
-		// The test pod's job is to post nightly/integration at the head.
-		var status struct {
-			Statuses []struct {
-				Context string `json:"context"`
-			} `json:"statuses"`
-		}
-		if err := d.github(ctx, fmt.Sprintf("/repos/%s/%s/commits/%s/status", owner, name, pr.Head.SHA), &status); err != nil {
-			return false, err
-		}
-		for _, s := range status.Statuses {
-			if s.Context == "nightly/integration" {
-				return true, nil
-			}
-		}
-		return false, nil
-	case "mergeable":
-		// The merge pod's job is to merge it, and it is not merged.
-		return false, nil
-	default:
-		// A route with no completion check here would be swept as "done"
-		// forever. Loud instead: it lands in the sweep's errors.
-		return false, fmt.Errorf("no work check for column %q; see routes", column)
-	}
-}
-
-// github GETs a path on the REST API with the token the pods push with.
-// Without a token every call fails and the sweep can only report errors,
-// which is the right shape: a missing token must read as "could not
-// check", never as "no work exists".
+// github reads the REST API with the configured token.
 func (d *dispatcher) github(ctx context.Context, p string, out any) error {
 	return getJSON(ctx, d.client, d.githubURL+p, d.ghToken, out)
 }
@@ -324,7 +243,6 @@ type pullRequest struct {
 	Number   int     `json:"number"`
 	MergedAt *string `json:"merged_at"`
 	Head     struct {
-		SHA  string `json:"sha"`
 		Ref  string `json:"ref"`
 		Repo struct {
 			FullName string `json:"full_name"`
@@ -372,6 +290,9 @@ func (d *dispatcher) completeMergedTask(ctx context.Context, id, column string, 
 	if err := d.kaneo(ctx, p, &task); err != nil {
 		return false, err
 	}
+	if task["id"] == nil || task["projectId"] == nil || task["status"] == nil {
+		return false, fmt.Errorf("task response is missing id, projectId or status")
+	}
 	if task["id"] != id || task["projectId"] != d.project || task["status"] != column {
 		return false, nil
 	}
@@ -384,25 +305,10 @@ func (d *dispatcher) completeMergedTask(ctx context.Context, id, column string, 
 		}
 	}
 	task["status"] = "done"
-	raw, err := json.Marshal(task)
-	if err != nil {
+	if err := requestJSON(ctx, d.client, http.MethodPut, d.kaneoURL+"/api"+p, d.apiKey, task, nil); err != nil {
 		return false, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, d.kaneoURL+"/api"+p, bytes.NewReader(raw))
-	if err != nil {
-		return false, err
-	}
-	req.Header.Set("Authorization", "Bearer "+d.apiKey)
-	req.Header.Set("Content-Type", "application/json")
-	res, err := d.client.Do(req)
-	if err != nil {
-		return false, err
-	}
-	_, _ = io.Copy(io.Discard, res.Body)
-	_ = res.Body.Close()
-	if res.StatusCode/100 != 2 {
-		return false, fmt.Errorf("cannot move merged task to Done: HTTP %d", res.StatusCode)
-	}
+
 	var updated struct {
 		ProjectID string `json:"projectId"`
 		Status    string `json:"status"`

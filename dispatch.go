@@ -1,25 +1,12 @@
-// Binary kaneo-dispatcher turns a Kaneo card move into a pod run.
-//
-// Kaneo POSTs here whenever a task changes column, and the column it landed
-// in decides what happens. Most columns decide nothing: see routes. That
-// table IS the safety property - a pod moving a card to in-progress cannot
-// re-trigger the author, because in-progress triggers nothing. There is no
-// actor check anywhere here and none is needed: the pipeline flows one way,
-// so the only way to make a cycle is for a human to drag a card backwards,
-// which is a deliberate "do it again".
-//
-// Work starts when a card moves rather than at 00:00, and each stage hands
-// to the next by moving the card. The CronJobs that ran the stages on a
-// clock were removed 2026-11-10; there is no fallback clock, and the sweep
-// in reconcile.go is the safety net under the events.
+// Binary kaneo-dispatcher launches worker stages for Kaneo card movements.
 package main
 
 import (
 	"context"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -48,14 +35,7 @@ func (s stage) pod() string { return sessionSet + "-" + strconv.Itoa(s.ordinal) 
 // the sweep hands stranded cards back to this route by key.
 const authorColumn = "to-do"
 
-// routes maps a column slug to its stage. Anything not here is inert.
-//
-// The column set is known in four other places, and a new route has to
-// reach all of them: workExists in reconcile.go says what finished work
-// looks like for the column, sweeps in the same file says which columns
-// a card can strand in, the graph in claude-pods/lib/pod-common.sh says
-// which columns the scripts may move a card to, and the README describes
-// the pipeline.
+// routes maps dispatching columns to stages; other movements are audit-only.
 var routes = map[string]stage{
 	authorColumn: {0, "/usr/local/bin/stage-author"},
 	"in-review":  {2, "/usr/local/bin/stage-test"},
@@ -73,31 +53,14 @@ func wakeReplicas() int {
 	return n
 }
 
-// The two commands this service ever runs in a session pod, both through
-// `sh -c`. Named so the tests assert against the same strings the pod
-// receives rather than retyping them.
-const (
-	// busyProbe asks whether a stage is already running. The scripts take
-	// a lock themselves (take_pod_lock in pod-common.sh), so what is
-	// probed is what a run actually holds: flock -n succeeds only if
-	// nothing holds it, so exit 0 means idle and anything else means busy.
-	// The path expression is the scripts' own, NIGHTLY_LOCK override
-	// included, so the two sides cannot lock different files.
-	busyProbe = `flock -n "${NIGHTLY_LOCK:-/tmp/nightly.lock}" true`
+// busyProbe uses the same lock path as the workers. Exit 1 means contention.
+const busyProbe = `flock -n "${NIGHTLY_LOCK:-/tmp/nightly.lock}" true`
 
-	// launchLine starts a stage and returns at once. $0 is the script, $1
-	// the task id and $2 the repo, passed as positional arguments rather
-	// than spliced into the command text. The repo rides along so a named
-	// task is workable from ANY column without the stage re-resolving
-	// labels - stage-author refuses a task without it.
-	//
-	// setsid + nohup because a plain exec ties the run's life to the
-	// connection: the API server, a dispatcher restart, a rollout, or a
-	// network blip kills the agent mid-ticket. An author run takes up to
-	// an hour, so that window is most of the run. The first real dispatch
-	// died this way within seconds of starting.
-	launchLine = `setsid nohup "$0" "$1" "$2" >/dev/null 2>&1 </dev/null &`
-)
+// launchLine waits for the worker's lock acknowledgment while the accepted
+// stage continues detached. It is shared verbatim with the launch tests.
+//
+//go:embed launch.sh
+var launchLine string
 
 // execer runs argv in a session pod and reports its exit code. An error
 // means the command could not be run at all - the API server was
@@ -307,7 +270,11 @@ func (d *dispatcher) dispatch(ctx context.Context, column string, st stage, c ca
 		slog.Warn("skip", "task", c.name(), "column", column, "reason", skip)
 		return
 	}
-	if err := d.runStage(ctx, repo, st, c); err != nil && !errors.Is(err, errPodBusy) {
+	if err := d.runStage(ctx, repo, st, c, column); err != nil {
+		if errors.Is(err, errPodBusy) || errors.Is(err, errCardChanged) {
+			slog.Warn("skip", "task", c.name(), "column", column, "repo", repo, "reason", err)
+			return
+		}
 		slog.Error("dispatch failed", "task", c.name(), "column", column, "repo", repo, "err", err)
 	}
 }
@@ -333,41 +300,50 @@ func (d *dispatcher) repoFor(ctx context.Context, id string, st stage) (repo, sk
 	return repo, "", nil
 }
 
-// runStage wakes the session pods and launches the stage in its pod,
-// unless a run is already there. The error is a wake or a launch that
-// could not be done. errPodBusy is a skipped launch, reported separately
-// so the sweep never counts a busy worker as dispatched.
-var errPodBusy = errors.New("pod busy or unreachable")
+var (
+	errPodBusy     = errors.New("pod busy")
+	errCardChanged = errors.New("card changed before launch")
+)
 
-func (d *dispatcher) runStage(ctx context.Context, repo string, st stage, c card) error {
-	// The set sleeps at 0 replicas when idle; the session-sleep CronJob in
-	// claude-pods/ puts it there and this is the matching wake. Always
-	// every pod, never just the stage's: see wakeReplicas. Not remembered
-	// between calls: scaling an awake set to its own size is a no-op, so
-	// asking every time costs one read and can never disagree with the
-	// cluster. A wake that fails leaves the card where it is; the sweep is
-	// the retry, priced honestly - hourly, and only once the card is
-	// RECONCILE_STALE old - so a dropped wake costs hours, not forever.
+// runStage wakes the pods, rechecks the card and waits for worker acceptance.
+func (d *dispatcher) runStage(ctx context.Context, repo string, st stage, c card, column string) error {
+	// Wake every routed pod; the StatefulSet may be scaled to zero.
 	if err := d.wake(ctx); err != nil {
 		return fmt.Errorf("wake: %w", err)
 	}
+	// Waking can take minutes. A human may have moved the card meanwhile.
+	var current struct {
+		ID        string `json:"id"`
+		ProjectID string `json:"projectId"`
+		Status    string `json:"status"`
+	}
+	if err := d.kaneo(ctx, "/task/"+url.PathEscape(c.ID), &current); err != nil {
+		return err
+	}
+	if current.ID == "" || current.ProjectID == "" || current.Status == "" {
+		return fmt.Errorf("task response is missing id, projectId or status")
+	}
+	if current.ID != c.ID || current.ProjectID != d.project || current.Status != column {
+		return errCardChanged
+	}
 	pod := st.pod()
-	if d.podIsBusy(ctx, pod) {
-		// Dropped rather than queued: the card stays where it is, so
-		// moving it again once the current run finishes is the retry. A
-		// queue here would silently stack up work nobody asked for twice.
-		slog.Warn("busy", "task", c.name(), "repo", repo, "pod", pod, "hint", "move the card again later")
+	busy, err := d.podIsBusy(ctx, pod)
+	if err != nil {
+		return err
+	}
+	if busy {
 		return errPodBusy
 	}
 	slog.Info("start", "task", c.name(), "repo", repo, "pod", pod, "script", path.Base(st.script))
-	// Bounded like the busy probe. The shell returns as soon as the run is
-	// backgrounded, so a launch that takes this long is a stream that
-	// hung, and cancelling it cannot reach the detached run anyway.
+	// The worker acknowledges its lock before continuing detached.
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	rc, err := d.exec(ctx, pod, []string{"sh", "-c", launchLine, st.script, c.ID, repo})
 	if err != nil {
 		return fmt.Errorf("launch in %s: %w", pod, err)
+	}
+	if rc == 75 {
+		return errPodBusy
 	}
 	if rc != 0 {
 		return fmt.Errorf("launch in %s exited %d", pod, rc)
@@ -378,25 +354,23 @@ func (d *dispatcher) runStage(ctx context.Context, repo string, st stage, c card
 	return nil
 }
 
-// podIsBusy reports whether a stage is already running in this pod, or
-// whether that could not be determined - which counts as busy, because
-// an unanswered question must not start a second agent on a live clone.
-//
-// Advisory: the probe and the launch are two execs, so two dispatchers
-// can both see idle. The atomic refusal is take_pod_lock in the script
-// itself; this buys the `busy` log line and saves starting a run that
-// would exit at once. Asked of the pod, not of this process: the run is
-// detached, so anything remembered here would clear the moment the
-// launch returned, and would not survive a restart either.
-func (d *dispatcher) podIsBusy(ctx context.Context, pod string) bool {
+// podIsBusy distinguishes lock contention from a failed probe. Neither
+// outcome permits launching; callers report probe failures as errors.
+func (d *dispatcher) podIsBusy(ctx context.Context, pod string) (bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	rc, err := d.exec(ctx, pod, []string{"sh", "-c", busyProbe})
 	if err != nil {
-		slog.Warn("cannot tell whether pod is busy; assuming it is", "pod", pod, "err", err)
-		return true
+		return false, fmt.Errorf("probe %s: %w", pod, err)
 	}
-	return rc != 0
+	switch rc {
+	case 0:
+		return false, nil
+	case 1:
+		return true, nil
+	default:
+		return false, fmt.Errorf("probe %s exited %d", pod, rc)
+	}
 }
 
 // podWorksRepo reports whether a pod works this repo at all.
@@ -456,35 +430,7 @@ func (d *dispatcher) kaneo(ctx context.Context, p string, out any) error {
 	return getJSON(ctx, d.client, d.kaneoURL+"/api"+p, d.apiKey, out)
 }
 
-// getJSON fetches one JSON document with a bearer token. A non-2xx answer
-// is an error; so is a body that does not decode into out - a typed
-// decode is what turns `{"error": ...}` with a 200 into a parse failure
-// rather than a silently empty value.
+// getJSON reads a JSON response; callers validate endpoint-specific fields.
 func getJSON(ctx context.Context, client *http.Client, u, bearer string, out any) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Accept", "application/json")
-	if bearer != "" {
-		req.Header.Set("Authorization", "Bearer "+bearer)
-	}
-	res, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	// Drained so the connection is reusable: the sweep makes several
-	// calls per card against the same two hosts. Neither error can change
-	// what Decode has already returned by the time this runs.
-	defer func() {
-		_, _ = io.Copy(io.Discard, res.Body)
-		_ = res.Body.Close()
-	}()
-	if res.StatusCode/100 != 2 {
-		return fmt.Errorf("GET %s: unexpected status %d", req.URL.Path, res.StatusCode)
-	}
-	if err := json.NewDecoder(res.Body).Decode(out); err != nil {
-		return fmt.Errorf("GET %s: %w", req.URL.Path, err)
-	}
-	return nil
+	return requestJSON(ctx, client, http.MethodGet, u, bearer, nil, out)
 }

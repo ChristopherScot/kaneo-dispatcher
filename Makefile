@@ -5,6 +5,8 @@
 SHELL := /bin/bash
 .DEFAULT_GOAL := help
 
+BINARY := bin/app
+
 PORT ?= 8080
 export PORT
 
@@ -25,7 +27,7 @@ endif
 # -o and the package are load-bearing.
 .PHONY: build
 build:
-	CGO_ENABLED=0 go build -o bin/app .
+	CGO_ENABLED=0 go build -o $(BINARY) .
 
 # -race matches CI.
 .PHONY: test
@@ -46,6 +48,6 @@ regen:
 .PHONY: clean
 clean:
 	go clean
-	rm -f kaneo-dispatcher
+	rm -f $(BINARY)
 
 -include Makefile.local

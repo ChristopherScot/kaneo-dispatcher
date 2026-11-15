@@ -27,13 +27,15 @@ step with the column graph written down in
    ready, bounded at ten minutes. The `session-sleep` CronJob in
    `claude-pods/` is the matching sleep. A wake that fails is logged for
    the card and nothing is exec'd; the sweep below is the retry.
-5. The pod's lock file is probed with `flock -n`, the same file the
+5. The card is re-read after waking. If its project or column changed, the
+   launch is skipped. The pod's lock file is probed with `flock -n`, the same file the
    scripts lock. A pod that is already running a stage is left alone and
    the card stays where it is: moving it again later is the retry.
-6. The stage is launched detached (`setsid nohup ... &`) through the
-   Kubernetes exec API, so it outlives this process, a rollout and any
-   network blip. It is handed the task id and the repo, since
-   `stage-author` refuses a named task without one.
+6. The stage is launched detached through the Kubernetes exec API. The
+   dispatcher waits up to 20 seconds for the worker to acknowledge acquiring
+   its lock before reporting a successful launch. A competing worker is
+   skipped; an absent executable or missing acknowledgment is an error.
+   The accepted stage outlives the dispatcher and receives the task id and repo.
 
 `POST /reconcile`, behind the same signature, checks active and human-review
 cards for a merged PR and moves them to Done. It uses the newest matching
@@ -43,7 +45,8 @@ a concurrent edit between the final read and PUT can still be overwritten.
 
 Unfinished work in dispatching columns is retried after `RECONCILE_STALE`
 (4h). Stale In Progress cards return to the author, whose mode logic decides
-how to resume. Unmerged human-review cards remain parked. Busy workers are
+how to resume. Existing PRs or integration statuses do not suppress retries:
+the stage owns recovery of unfinished work. Unmerged human-review cards remain parked. Busy workers are
 reported as skipped, and failed launches as errors. `POST /reconcile?dry`
 performs reads only. The hourly `kaneo-reconcile` CronJob remains the caller.
 
@@ -53,6 +56,8 @@ performs reads only. The hourly `kaneo-reconcile` CronJob remains the caller.
 main.go        process lifecycle: logging, timeouts, shutdown
 server.go      routes, metrics middleware, the bounded signed read
 dispatch.go    the column table, label lookup, wake, busy probe, launch
+launch.sh      detached launch and worker acceptance handshake
+http.go        authenticated JSON requests and response validation
 reconcile.go   the sweep, and the GitHub questions it asks
 kube.go        exec and the StatefulSet wake through the API server,
                with the pod's own identity
@@ -78,7 +83,8 @@ make build
 ```
 
 The tests need no cluster, no Kaneo and no GitHub: `testhelp_test.go`
-fakes all three and records what the dispatcher asked a pod to run.
+fakes all three and records what the dispatcher asked a pod to run. Linux
+also executes the launcher against short-lived worker fixtures.
 
 ## Deploy
 
@@ -97,7 +103,10 @@ This PR transfers the existing Deployment, Service and Ingress from the
 `claude-pods` Argo Application to `kaneo-dispatcher`. A normal automated sync
 could prune them before the replacement image or Vault role is ready.
 
-1. Publish the service image from this branch using the workflow's manual
+1. Deploy the companion homelab worker change (`NIGHTLY_LAUNCH_ACK` support
+   in `pod-common.sh`) before switching the dispatcher. Confirm every session
+   pod uses that worker image; older workers cannot acknowledge launches.
+   Publish the service image from this branch using the workflow's manual
    trigger. It publishes a SHA tag; verify that image before selecting it for
    the first rollout. The default branch publishes `latest` after merging.
 2. From this directory, run `homelabctl vault --apply` with an authenticated
@@ -110,8 +119,9 @@ could prune them before the replacement image or Vault role is ready.
 4. Confirm Argo tracking on Deployment, Service and Ingress now names
    `kaneo-dispatcher` before allowing the old Application to prune. Restore
    the recorded sync settings and confirm both Applications are healthy.
-5. Verify a signed dry reconcile and a controlled dispatch through client-go
-   against the real kubelet. Keep the card open until these checks pass.
+5. Verify a signed dry reconcile and fake tickets through the complete board
+   and worker pipeline, including recovery after an interrupted stage. Keep
+   the card open until these checks pass.
 
 If the new deployment fails, stop its automatic sync before restoring the
 previous Deployment/Service/Ingress from the pre-merge revision. Preserve the

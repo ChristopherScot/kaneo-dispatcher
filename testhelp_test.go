@@ -182,14 +182,12 @@ func (s *stubKaneo) calls() int {
 	return s.hits
 }
 
-// stubGitHub answers the pull-request and commit-status lookups the
-// sweep makes. prs is keyed by the `head` query parameter.
+// stubGitHub answers PR lookups, keyed by the head query parameter.
 type stubGitHub struct {
-	mu       sync.Mutex
-	prs      map[string][]map[string]any
-	statuses map[string][]string // head sha -> status contexts
-	fail     int                 // non-zero: answer everything with this status
-	hits     []string
+	mu   sync.Mutex
+	prs  map[string][]map[string]any
+	fail int // non-zero: answer everything with this status
+	hits []string
 }
 
 func (s *stubGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -208,14 +206,6 @@ func (s *stubGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			prs = []map[string]any{}
 		}
 		_ = json.NewEncoder(w).Encode(prs)
-	case strings.HasSuffix(r.URL.Path, "/status"):
-		parts := strings.Split(r.URL.Path, "/")
-		sha := parts[len(parts)-2]
-		statuses := []map[string]string{}
-		for _, c := range s.statuses[sha] {
-			statuses = append(statuses, map[string]string{"context": c})
-		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"statuses": statuses})
 	default:
 		http.NotFound(w, r)
 	}
@@ -264,7 +254,7 @@ func newFixture(t *testing.T) *fixture {
 	f := &fixture{
 		t:      t,
 		kaneo:  &stubKaneo{tasks: map[string]map[string]any{}, labels: map[string][]string{}, activity: map[string][]map[string]string{}},
-		github: &stubGitHub{prs: map[string][]map[string]any{}, statuses: map[string][]string{}},
+		github: &stubGitHub{prs: map[string][]map[string]any{}},
 		pods:   &recorder{},
 		log:    &lockedBuffer{},
 	}
@@ -318,6 +308,12 @@ func (f *fixture) post(path, body string, headers ...string) *httptest.ResponseR
 // signed posts a body with a valid signature.
 func (f *fixture) signed(path, body string) *httptest.ResponseRecorder {
 	f.t.Helper()
+	var event delivery
+	if json.Unmarshal([]byte(body), &event) == nil && event.Task.ID != "" {
+		if _, ok := f.kaneo.tasks[event.Task.ID]; !ok {
+			f.kaneo.tasks[event.Task.ID] = map[string]any{"id": event.Task.ID, "projectId": f.d.project, "status": event.Data.NewStatus}
+		}
+	}
 	return f.post(path, body, "X-Kaneo-Signature", sign(body))
 }
 

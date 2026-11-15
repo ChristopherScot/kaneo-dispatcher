@@ -211,21 +211,20 @@ func TestBusyPodIsNotGivenASecondRun(t *testing.T) {
 	f.kaneo.labels["t2"] = []string{"repo:testrepo"}
 	f.signed("/", move("t2", "to-do"))
 	f.wantNoLaunch()
-	f.wantLog("msg=busy task=t2 repo=TestOwner/testrepo pod=claude-session-0")
+	f.wantLog(`reason="pod busy"`)
 }
 
 // A failed probe must not read as idle: starting a second agent on a
 // live clone is the one thing the guard exists to prevent.
-func TestUnansweredBusyProbeReadsAsBusy(t *testing.T) {
+func TestUnansweredBusyProbeReportsAnError(t *testing.T) {
 	f := newFixture(t)
 	f.pods.fail = errors.New("the API server is away")
 	f.kaneo.labels["t2"] = []string{"repo:testrepo"}
 	f.signed("/", move("t2", "to-do"))
 	f.wantNoLaunch()
-	f.wantLog("cannot tell whether pod is busy; assuming it is")
-	// The busy line follows, and its hint still holds: moving the card
-	// again is the retry after an outage too, since no webhook re-fires.
-	f.wantLog("msg=busy task=t2")
+	f.wantLog("dispatch failed")
+	f.wantLog("probe claude-session-0")
+
 }
 
 func TestPodThatDoesNotWorkTheRepoIsSkipped(t *testing.T) {
@@ -352,13 +351,27 @@ func TestWebhookAcceptsAnyPath(t *testing.T) {
 
 func TestNonzeroLaunchIsAnError(t *testing.T) {
 	f := newFixture(t)
+	f.kaneo.tasks["t1"] = map[string]any{"id": "t1", "projectId": "proj", "status": authorColumn}
 	f.d.exec = func(ctx context.Context, pod string, argv []string) (int, error) {
 		if argv[2] == launchLine {
 			return 7, nil
 		}
 		return 0, nil
 	}
-	if err := f.d.runStage(t.Context(), "TestOwner/testrepo", routes[authorColumn], card{ID: "t1"}); err == nil || !strings.Contains(err.Error(), "exited 7") {
+	if err := f.d.runStage(t.Context(), "TestOwner/testrepo", routes[authorColumn], card{ID: "t1"}, authorColumn); err == nil || !strings.Contains(err.Error(), "exited 7") {
 		t.Fatalf("launch error=%v", err)
 	}
+}
+
+func TestCardMovedDuringWakeDoesNotLaunch(t *testing.T) {
+	f := newFixture(t)
+	f.kaneo.labels["t1"] = []string{"repo:testrepo"}
+	f.d.wake = func(context.Context) error {
+		f.kaneo.mu.Lock()
+		defer f.kaneo.mu.Unlock()
+		f.kaneo.tasks["t1"]["status"] = "backlog"
+		return nil
+	}
+	f.signed("/", move("t1", "to-do"))
+	f.wantNoLaunch()
 }
