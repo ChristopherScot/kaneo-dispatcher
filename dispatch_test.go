@@ -322,7 +322,11 @@ func TestLabelLookupFailureIsAnErrorNotNoLabel(t *testing.T) {
 // rather than an empty list.
 func TestNonArrayLabelAnswerIsAnError(t *testing.T) {
 	f := newFixture(t)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/task-relation/") {
+			_, _ = io.WriteString(w, `[]`)
+			return
+		}
 		_, _ = io.WriteString(w, `{"error":"unauthorized"}`)
 	}))
 	t.Cleanup(srv.Close)

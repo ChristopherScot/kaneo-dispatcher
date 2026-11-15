@@ -83,7 +83,11 @@ func (d *dispatcher) reconcile(ctx context.Context, dryRun bool) (sweep, error) 
 			out.checked++
 			result, err := d.reconcileCard(ctx, col.Slug, c, dryRun, b)
 			if err != nil {
-				out.errors = append(out.errors, c.name()+": "+err.Error())
+				if errors.Is(err, errWorkflowBlocked) {
+					out.skipped = append(out.skipped, c.name()+": "+err.Error())
+				} else {
+					out.errors = append(out.errors, c.name()+": "+err.Error())
+				}
 				continue
 			}
 			switch result.outcome {
@@ -105,6 +109,20 @@ func (d *dispatcher) reconcile(ctx context.Context, dryRun bool) (sweep, error) 
 // read as "nothing to do", because a card nobody can see is the failure
 // this sweep exists for.
 func (d *dispatcher) reconcileCard(ctx context.Context, column string, c card, dryRun bool, b board) (cardResult, error) {
+	rels, err := d.relations(ctx, c.ID)
+	if err != nil {
+		return cardResult{}, err
+	}
+	if children := relationChildren(rels, c.ID); len(children) > 0 {
+		return d.workflowParent(ctx, c.ID, children, dryRun)
+	}
+	manual, err := d.manualTask(ctx, c.ID)
+	if err != nil {
+		return cardResult{}, err
+	}
+	if manual {
+		return cardResult{skipped, c.name() + ": manual completion required"}, nil
+	}
 	st, _ := sweeps(column)
 
 	if column == "needs-human-review" {
@@ -140,6 +158,9 @@ func (d *dispatcher) reconcileCard(ctx context.Context, column string, c card, d
 		return cardResult{}, nil
 	}
 
+	if err := d.workflowGate(ctx, c.ID); err != nil {
+		return cardResult{}, err
+	}
 	work, err := d.taskWork(ctx, c.ID, st)
 	if err != nil {
 		return cardResult{}, err
@@ -180,7 +201,7 @@ func (d *dispatcher) reconcileCard(ctx context.Context, column string, c card, d
 	// summary line is what a morning reads, and "redispatched 1" over a
 	// card that never started is worse than silence.
 	if err := d.runStage(ctx, repo, st, c, column); err != nil {
-		if errors.Is(err, errPodBusy) || errors.Is(err, errCardChanged) || errors.Is(err, errWorkStarted) {
+		if errors.Is(err, errPodBusy) || errors.Is(err, errCardChanged) || errors.Is(err, errWorkStarted) || errors.Is(err, errWorkflowBlocked) {
 			return cardResult{skipped, c.name() + ": " + err.Error()}, nil
 		}
 		return cardResult{}, err
@@ -274,7 +295,13 @@ func (d *dispatcher) runSweep(ctx context.Context, dryRun bool) {
 type pullRequest struct {
 	Number   int     `json:"number"`
 	MergedAt *string `json:"merged_at"`
-	Head     struct {
+	Base     struct {
+		Ref  string `json:"ref"`
+		Repo struct {
+			FullName string `json:"full_name"`
+		} `json:"repo"`
+	} `json:"base"`
+	Head struct {
 		Ref  string `json:"ref"`
 		Repo struct {
 			FullName string `json:"full_name"`
@@ -317,6 +344,10 @@ func (d *dispatcher) completeMergedTask(ctx context.Context, id, column string, 
 	if done != 1 {
 		return false, fmt.Errorf("project must have exactly one Done column")
 	}
+	return d.moveTask(ctx, id, column, "done", dry)
+}
+
+func (d *dispatcher) moveTask(ctx context.Context, id, column, target string, dry bool) (bool, error) {
 	p := "/task/" + url.PathEscape(id)
 	var task map[string]any
 	if err := d.kaneo(ctx, p, &task); err != nil {
@@ -336,7 +367,7 @@ func (d *dispatcher) completeMergedTask(ctx context.Context, id, column string, 
 			delete(task, k)
 		}
 	}
-	task["status"] = "done"
+	task["status"] = target
 	if err := requestJSON(ctx, d.client, http.MethodPut, d.kaneoURL+"/api"+p, d.apiKey, task, nil); err != nil {
 		return false, err
 	}
@@ -348,8 +379,8 @@ func (d *dispatcher) completeMergedTask(ctx context.Context, id, column string, 
 	if err := d.kaneo(ctx, p, &updated); err != nil {
 		return false, err
 	}
-	if updated.ProjectID != d.project || updated.Status != "done" {
-		return false, fmt.Errorf("merged task update did not leave the card in Done")
+	if updated.ProjectID != d.project || updated.Status != target {
+		return false, fmt.Errorf("task update did not leave the card in %s", target)
 	}
 	return true, nil
 }

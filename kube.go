@@ -14,6 +14,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	typedappsv1 "k8s.io/client-go/kubernetes/typed/apps/v1"
+	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/remotecommand"
 	utilexec "k8s.io/client-go/util/exec"
@@ -34,14 +35,14 @@ const sessionSet = "claude-session"
 // the pod first to pick a container, this names the pod and lets the API
 // server pick. The wake needs `get` on the StatefulSet and `get`+`update`
 // on its scale subresource; rbac.yaml grants exactly that, by name.
-func newPodClient(ns string) (execer, waker, error) {
+func newPodClient(ns string) (execer, waker, typedcorev1.ConfigMapInterface, error) {
 	cfg, err := rest.InClusterConfig()
 	if err != nil {
-		return nil, nil, fmt.Errorf("in-cluster config: %w", err)
+		return nil, nil, nil, fmt.Errorf("in-cluster config: %w", err)
 	}
 	cs, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	exec := func(ctx context.Context, pod string, argv []string) (int, error) {
@@ -72,7 +73,7 @@ func newPodClient(ns string) (execer, waker, error) {
 	wake := func(ctx context.Context) error {
 		return wakeSet(ctx, cs.AppsV1().StatefulSets(ns), int32(wakeReplicas()))
 	}
-	return exec, wake, nil
+	return exec, wake, cs.CoreV1().ConfigMaps(ns), nil
 }
 
 const (

@@ -96,7 +96,8 @@ patches:
 # shared between two replicas. Nothing in this process guards a pod any
 # more: the scripts take a lock in the pod itself (take_pod_lock), so a
 # second dispatcher overlapping the first during a rollout can at worst
-# start a run that exits at once.
+# start a run that exits at once. Sequential workflow selections and move
+# claims are shared separately in the runtime kaneo-workflows ConfigMap.
 resources:
     cpuRequest: 10m
     memoryRequest: 32Mi

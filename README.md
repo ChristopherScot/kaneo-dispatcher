@@ -62,6 +62,66 @@ the stage owns recovery of unfinished work. Unmerged human-review cards remain p
 reported as skipped, and failed launches as errors. `POST /reconcile?dry`
 performs reads only. The `kaneo-reconcile` CronJob remains the caller.
 
+## Sequential subtasks
+
+A card with Kaneo `subtask` relations is a parent queue. Move it to To Do:
+its plan is saved, it moves to In Progress, and only its first child moves
+from Backlog to To Do. The parent is never sent to a worker. The existing
+minute sweep advances the queue after each selected child is **Done and its
+newest exact-branch, same-repository PR is merged into the default branch**.
+A closed PR or a card manually marked Done is insufficient. The parent becomes
+Done after the last child meets that condition.
+
+Children are ordered by structured `blocks` dependencies, with ticket number
+breaking ties. This order is saved when the parent starts; board position does
+not reorder a running queue. External prerequisites must also be Done with a
+merged PR, but the dispatcher never starts them. Cycles, shared/nested subtasks,
+missing tasks, changed plans, reopened completed children, and later children
+outside Backlog block progress. Both webhook and reconcile launches enforce
+these gates, including a recheck after waking pods. Removing a relation cannot
+turn a saved child or parent into unrestricted standalone work.
+
+An active child retains the existing 15-minute unclaimed / four-hour started
+retry policy. A child returned to Backlog or parked for human review holds its
+place; subsequent children remain untouched. Retry a failed child explicitly
+by moving that child to To Do. Pause a parent by moving it to Backlog; this
+prevents new launches, but does not cancel an already-running worker. Resume
+by moving the parent to To Do (or In Progress).
+
+Label a task `workflow:manual` to exclude it from **all** worker stages,
+including a direct drag to Mergeable. Complete/review/merge that task manually,
+then mark it Done; its queue verifies the merge before advancing. This is a
+manual gate, not an approval token: removing the label enables automation and
+must be a deliberate operator decision. CLA-27 uses this gate for cutover.
+The dispatcher does not infer approval from ticket prose or worker comments.
+Existing hand-run worker scripts bypass the dispatcher; do not use their
+unfiltered sweep mode for these workflows.
+
+The runtime ConfigMap `claude-pods/kaneo-workflows` stores one JSON value per
+parent. It is created by the service, has no secrets, and is deliberately not
+an Argo-managed manifest. Kubernetes resource versions protect competing
+selections and one-shot movement claims during rolling deployments. Preserve
+this map across restarts/deployments; deleting it discards progress and the
+record of attempted moves. Its RBAC is in `rbac.yaml`; no new environment
+settings or Vault secrets are needed.
+
+Kaneo has no conditional PUT. Each automatic transition is claimed durably
+**before** its PUT to prevent duplicate deliveries overwriting newer worker
+state. If the process dies or an API call fails after that claim, the next
+sweep observes the result but does not blindly repeat the write. If the card
+never moved, inspect the workflow log and recover explicitly: move the selected
+child to To Do, a starting parent to In Progress, or a fully completed parent
+to Done after verifying its children. A concurrent human edit between the final
+GET and PUT remains subject to Kaneo's existing API limitation. To change a
+saved plan, pause the parent and settle any worker first; restore the original
+relations to resume, or deliberately reset that parent's saved state after
+reviewing every child's status. Do not delete the whole map to reset one queue.
+
+For the migration backlog, the order is CLA-22 → CLA-23 → CLA-24 → CLA-25 →
+CLA-26 → CLA-27. CLA-23 additionally waits for CLA-20; CLA-27 stays manual.
+These cards remain in Backlog until CLA-28 is activated after this service
+change is deployed.
+
 ## Layout
 
 ```
@@ -71,6 +131,7 @@ dispatch.go    the column table, label lookup, wake, busy probe, launch
 launch.sh      detached launch and worker acceptance handshake
 http.go        authenticated JSON requests and response validation
 reconcile.go   the sweep, and the GitHub questions it asks
+workflow.go    dependency gates and durable sequential parent queues
 kube.go        exec and the StatefulSet wake through the API server,
                with the pod's own identity
 rbac.yaml      the Role that allows both; listed in config.yaml
@@ -78,7 +139,7 @@ config.yaml    what this service is, for homelabctl
 deploy/        Kubernetes manifests, rendered from config.yaml
 ```
 
-Everything the service reads comes from the environment, and every
+Startup configuration comes from the environment, and every
 secret in it is a key under `secrets:` in `config.yaml`, read from Vault.
 The Vault role that allows those reads is derived from the same file:
 

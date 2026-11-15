@@ -20,6 +20,15 @@ metadata:
   name: kaneo-dispatcher
   namespace: claude-pods
 rules:
+  # Runtime state is not an Argo-managed manifest. Create cannot be name-scoped
+  # by Kubernetes RBAC; subsequent reads and updates are limited to this map.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["kaneo-workflows"]
+    verbs: ["get", "update"]
   - apiGroups: [""]
     resources: ["pods/exec"]
     verbs: ["create"]
