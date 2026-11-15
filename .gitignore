@@ -5,3 +5,5 @@ bin/
 # gets committed on the first `git add -A`, and a multi-megabyte binary
 # in git history is not removable by a later .gitignore.
 /kaneo-dispatcher
+
+.homelab/

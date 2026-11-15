@@ -6,6 +6,9 @@ kind: Kustomization
 resources:
   - deployment.yaml
   - service.yaml
+  - externalsecret.yaml
+  - ingress.yaml
+  - manifests/rbac.yaml
 images:
   - name: ghcr.io/christopherscot/kaneo-dispatcher
     newTag: latest

@@ -1,32 +1,34 @@
 package main
 
-// Specless variant, scaffolded by `homelabctl init --no-spec` for a
-// service whose shape openapi cannot usefully express - a proxy, a
-// websocket endpoint, anything serving HTML or wanting a catch-all.
-// There is no openapi.yml, no generated api/ and no clients.
+// The HTTP surface. Specless, scaffolded by `homelabctl init --no-spec`:
+// there is no openapi.yml, no generated api/ and no clients. The routes
+// are hand-written below; what each one does lives in dispatch.go and
+// reconcile.go.
 //
-// This file is YOURS to edit. Two things below are load-bearing:
+// Two things here are load-bearing:
 //
-//   - /health exists here because nothing else creates it; without it
-//     the readinessProbe hits a pod that never becomes ready.
+//   - /healthz exists because nothing else creates it; without it the
+//     readinessProbe hits a pod that never becomes ready.
 //   - metrics are labelled by ROUTE PATTERN, never by request path.
 //     Without a generated router rejecting unrouted paths, a raw URL as
 //     a label is unbounded cardinality and writes caller-controlled
 //     strings into the monitoring stack.
 
 import (
-	"encoding/json"
+	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"io"
 	"log/slog"
 	"net/http"
-	"os"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"golang.org/x/mod/semver"
 )
 
 var (
@@ -58,106 +60,122 @@ func (r *statusRecorder) WriteHeader(code int) {
 // request path, so a label can only ever be a string written in this file.
 func observe(route string, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
-		if tooOld(req) {
-			// 410 Gone, not 429: generated clients retry 429 and 5xx and
-			// nothing else, so 410 stops them dead.
-			slog.Warn("refusing a client below the floor",
-				"route", route,
-				"client", clientName(req),
-				"client_version", req.Header.Get(ClientVersionHeader),
-				"min_version", minVersion)
-			http.Error(w, "this client is too old; reload or upgrade", http.StatusGone)
-			return
-		}
-
 		start := time.Now()
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		next(rec, req)
 
 		elapsed := time.Since(start)
-		status := strconv.Itoa(rec.status)
-		requests.WithLabelValues(route, req.Method, status).Inc()
+		requests.WithLabelValues(route, req.Method, strconv.Itoa(rec.status)).Inc()
 		latency.WithLabelValues(route, req.Method).Observe(elapsed.Seconds())
 
 		slog.Info("request",
 			"method", req.Method,
 			"route", route,
 			"status", rec.status,
-			"client", clientName(req),
-			"client_version", req.Header.Get(ClientVersionHeader),
 			// Float milliseconds: elapsed.Milliseconds() truncates and a
-			// handler serving from memory logs duration_ms=0.
+			// handler answering from memory logs duration_ms=0.
 			"duration_ms", float64(elapsed.Nanoseconds())/1e6)
 	}
 }
 
-// No X- prefix: RFC 6648 deprecated it in 2012.
-const (
-	ClientNameHeader    = "Client-Name"
-	ClientVersionHeader = "Client-Version"
-)
-
-// minVersion is the oldest client this service answers, from MIN_VERSION.
-// Empty means no floor. Read at startup rather than compiled in, so
-// raising the floor is a config edit and a restart. If you drop this
-// floor, also delete scaffold_floor_test.go.
-var minVersion = os.Getenv("MIN_VERSION")
-
-// tooOld reports whether a caller is below the floor. FAILS OPEN on
-// unparseable versions and on a caller that sends no version - those are
-// curl, probes and scripts, not the stale client this exists to stop.
-//
-// Clients report a bare semver (npm forbids the leading v).
-func tooOld(r *http.Request) bool {
-	if minVersion == "" {
-		return false
+// handler is what main serves, and drain is what it waits on after the
+// listener is closed: work that was accepted with a 202 and is still
+// talking to Kaneo, GitHub or a pod.
+func handler() (h http.Handler, drain func(), err error) {
+	d, err := fromEnv()
+	if err != nil {
+		return nil, nil, err
 	}
-	got := r.Header.Get(ClientVersionHeader)
-	if got == "" {
-		return false
-	}
-	got, floor := "v"+got, "v"+strings.TrimPrefix(minVersion, "v")
-	if !semver.IsValid(got) || !semver.IsValid(floor) {
-		return false
-	}
-	return semver.Compare(got, floor) < 0
+	return d.mux(), d.inflight.Wait, nil
 }
 
-// clientName returns "unknown" rather than sniffing the user agent.
-func clientName(r *http.Request) string {
-	if n := r.Header.Get(ClientNameHeader); n != "" {
-		return n
-	}
-	return "unknown"
-}
-
-func writeJSON(w http.ResponseWriter, code int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	if err := json.NewEncoder(w).Encode(v); err != nil {
-		slog.Error("writing response", "err", err)
-	}
-}
-
-func handler() (http.Handler, error) {
+// mux is the route table. Separate from handler so a test can build a
+// dispatcher with fakes and serve the same routes.
+func (d *dispatcher) mux() http.Handler {
 	mux := http.NewServeMux()
 
-	// The manifest's readiness and liveness probes hit /health.
+	// The manifest's readiness and liveness probes hit /healthz.
 	// Deliberately NOT wrapped in observe: the kubelet probes it every
 	// few seconds, which would bury real traffic.
-	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "ok")
 	})
 
 	// The deployment's scrape annotation points here.
 	mux.Handle("GET /metrics", promhttp.Handler())
 
-	mux.HandleFunc("GET /{$}", observe("root", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{
-			"service": "kaneo-dispatcher",
-			"version": version,
-		})
-	}))
+	// Reconcile is a POST so it cannot be triggered by a stray GET, and it
+	// is behind the same HMAC as the webhook - it starts real work.
+	mux.HandleFunc("GET /reconcile", func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "POST with a signature", http.StatusMethodNotAllowed)
+	})
+	mux.HandleFunc("POST /reconcile", observe("reconcile", d.reconcileHandler))
 
-	return mux, nil
+	// Every other POST is a delivery, whatever its path: Kaneo is
+	// configured with the Service's root, and this is also what makes any
+	// non-POST a 405 rather than a webhook.
+	mux.HandleFunc("POST /", observe("webhook", d.webhook))
+	return mux
+}
+
+// reconcileHandler is the sweep, not a webhook. Same signature check,
+// since it starts the same work. `?dry` reports what the sweep would do
+// without doing it.
+func (d *dispatcher) reconcileHandler(w http.ResponseWriter, r *http.Request) {
+	if _, ok := d.verifiedBody(w, r); !ok {
+		return
+	}
+	dryRun := r.URL.Query().Has("dry")
+	w.WriteHeader(http.StatusAccepted)
+	d.detach(r, func(ctx context.Context) { d.runSweep(ctx, dryRun) })
+}
+
+// maxBody bounds a delivery. A task.status_changed payload is a few KB;
+// 1 MiB is generous.
+const maxBody = 1 << 20
+
+// verifiedBody reads a bounded body and verifies Kaneo's signature over
+// it. It has already answered the request - 413, 400 or 401 - when ok is
+// false, so a caller only ever sees bytes Kaneo signed.
+//
+// Bounded because this endpoint is unauthenticated until the HMAC is
+// checked, and the body must be buffered whole to check it. Without a cap
+// a large POST is memory growth an anonymous caller controls.
+func (d *dispatcher) verifiedBody(w http.ResponseWriter, r *http.Request) (body []byte, ok bool) {
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBody))
+	if err != nil {
+		var tooBig *http.MaxBytesError
+		if errors.As(err, &tooBig) {
+			slog.Warn("reject", "reason", "body over cap", "cap", maxBody)
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+		} else {
+			slog.Warn("reject", "reason", "unreadable body", "err", err)
+			w.WriteHeader(http.StatusBadRequest)
+		}
+		return nil, false
+	}
+	// Header.Get takes the first of a repeated header; see
+	// TestDuplicateSignatureHeaderStillVerifies for why that is pinned.
+	if !d.verify(raw, r.Header.Get("X-Kaneo-Signature")) {
+		slog.Warn("reject", "reason", "bad signature")
+		w.WriteHeader(http.StatusUnauthorized)
+		return nil, false
+	}
+	return raw, true
+}
+
+// verify checks Kaneo's HMAC-SHA256 over the exact bytes it sent.
+func (d *dispatcher) verify(body []byte, sigHex string) bool {
+	if sigHex == "" {
+		return false
+	}
+	got, err := hex.DecodeString(sigHex)
+	if err != nil {
+		return false
+	}
+	mac := hmac.New(sha256.New, d.secret)
+	_, _ = mac.Write(body) // a hash.Hash never returns an error
+	// hmac.Equal is constant-time and length-safe, so a wrong-length
+	// signature is simply false rather than a server error.
+	return hmac.Equal(got, mac.Sum(nil))
 }

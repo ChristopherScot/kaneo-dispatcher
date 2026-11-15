@@ -9,5 +9,5 @@ FROM gcr.io/distroless/static-debian12:nonroot
 COPY --chown=65532:65532 bin/app /app/app
 
 USER 65532:65532
-EXPOSE 3000
+EXPOSE 8080
 ENTRYPOINT ["/app/app"]
