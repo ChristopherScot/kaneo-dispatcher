@@ -167,7 +167,7 @@ answers on 80 (what the generated Ingress routes to) and on 8080, which
 is the port Kaneo's webhook integration and the reconcile CronJob post
 to: `http://kaneo-dispatcher.claude-pods.svc.cluster.local:8080`.
 
-`deploy/` is rendered from `config.yaml` with homelabctl v1.21.16 (also pinned in CI). Adjust it with `patches` there,
+`deploy/` is rendered from `config.yaml`. Adjust it with `patches` there,
 keyed by resource kind, rather than editing the manifests. `homelabctl register` publishes `deploy/kaneo-dispatcher/argocd.json` into the homelab repository.
 
 ### First deployment handoff
