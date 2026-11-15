@@ -97,7 +97,7 @@ The dispatcher does not infer approval from ticket prose or worker comments.
 Existing hand-run worker scripts bypass the dispatcher; do not use their
 unfiltered sweep mode for these workflows.
 
-The parent queue is an explicit finite state machine in plain Go:
+The parent queue uses [looplab/fsm](https://github.com/looplab/fsm) for its phase transitions:
 
 | Phase | Meaning | Next transition |
 | --- | --- | --- |
@@ -105,8 +105,20 @@ The parent queue is an explicit finite state machine in plain Go:
 | `awaiting-child` | Activation was claimed or an explicit start was observed. | Wait for Done plus a qualifying merge, then select the next child. |
 | `children-complete` | Every child met the completion gate. | Claim the parent's move to Done. |
 
+![Sequential child workflow](docs/workflow-fsm.png)
+
+The red node is the initial phase. Both merge events require Done **and** a
+qualifying merged PR. The `ready-child` self-loop handles a child completed
+before the dispatcher observed its activation. `child-activated` means an
+activation was claimed or an explicit start observed; worker-start receipts
+still control the separate four-hour grace period.
+
+Run `make graph` with Graphviz installed to regenerate the DOT and PNG. The
+build-only generator calls `fsm.Visualize(newWorkflowFSM(readyChild))` using
+the production transition table in `workflow_fsm.go`.
+
 A separate pending move records the task, source/target columns, and observed
-column visit. `nextWorkflow` is a pure decision function; its executor saves the
+column visit. `nextWorkflow` selects library events without I/O; its executor saves the
 proposed state with CAS before performing a newly claimed move. A loaded pending
 move is observed and acknowledged, never replayed. Pauses, manual flags, and
 unmet dependencies are live guards rather than additional stored states. Parent
@@ -148,6 +160,7 @@ launch.sh      detached launch and worker acceptance handshake
 http.go        authenticated JSON requests and response validation
 reconcile.go   the sweep, and the GitHub questions it asks
 workflow.go    dependency gates and durable sequential parent queues
+workflow_fsm.go looplab/fsm transition table, also used by make graph
 kube.go        exec and the StatefulSet wake through the API server,
                with the pod's own identity
 rbac.yaml      the Role that allows both; listed in config.yaml

@@ -245,6 +245,14 @@ func TestWorkflowRejectsInvalidPlansAndRechecksAfterWake(t *testing.T) {
 		}
 		f.wantNoLaunch()
 	})
+	t.Run("child completed before first observation", func(t *testing.T) {
+		f := workflowFixture(t)
+		f.mergeTask("a", "main")
+		_, err := f.d.workflowParent(ctx, "parent", []string{"a", "b", "c"}, false)
+		if err != nil || f.kaneo.tasks["b"]["status"] != "to-do" {
+			t.Fatalf("already-completed child stalled the queue: %v", err)
+		}
+	})
 	t.Run("dry run", func(t *testing.T) {
 		f := workflowFixture(t)
 		_, err := f.d.workflowParent(ctx, "parent", []string{"a", "b", "c"}, true)

@@ -24,14 +24,6 @@ const manualLabel = "workflow:manual"
 // ConfigMap CAS before calling Kaneo, whose PUT API has no conditional update.
 // A crash or timeout after that claim must be observed or recovered manually;
 // replaying an uncertain PUT could overwrite a worker's newer status.
-type workflowPhase string
-
-const (
-	readyChild       workflowPhase = "ready-child"
-	awaitingChild    workflowPhase = "awaiting-child"
-	childrenComplete workflowPhase = "children-complete"
-)
-
 type workflow struct {
 	Order        []string      `json:"order"`
 	Index        int           `json:"index"`
@@ -418,10 +410,10 @@ func (d *dispatcher) checkWorkflowPlan(ctx context.Context, state *workflow, ord
 	return nil
 }
 
-// nextWorkflow is the queue's transition table. It proposes a new durable
+// nextWorkflow selects FSM events from observations and proposes a durable
 // state; only a caller that saves it with CAS may execute its new Move.
 // An intent loaded from storage is never permission to repeat a PUT.
-func nextWorkflow(state workflow, seen workflowObservation) (workflowDecision, error) {
+func nextWorkflow(ctx context.Context, state workflow, seen workflowObservation) (workflowDecision, error) {
 	if state.Pending != nil {
 		if seen.PendingStatus == state.Pending.From && seen.PendingVisit.Equal(state.Pending.Visit) {
 			return workflowDecision{}, blocked("move of %s to %s was already attempted; verify its outcome and recover explicitly", state.Pending.Task, state.Pending.To)
@@ -441,22 +433,30 @@ func nextWorkflow(state workflow, seen workflowObservation) (workflowDecision, e
 	if seen.ChildDone && state.Phase != childrenComplete {
 		state.Index++
 		state.BacklogSince = seen.NextChildVisit
-		state.Phase = readyChild
+		event := advanceChildEvent
 		if state.Index == len(state.Order) {
-			state.Phase = childrenComplete
+			event = finishChildrenEvent
 		}
+		phase, err := state.Phase.transition(ctx, event)
+		if err != nil {
+			return workflowDecision{}, err
+		}
+		state.Phase = phase
 		return workflowDecision{State: state, Changed: true}, nil
 	}
 	switch state.Phase {
 	case readyChild:
-		if seen.ChildStatus != "backlog" {
-			state.Phase = awaitingChild // an explicit child start is also durable
-			return workflowDecision{State: state, Changed: true}, nil
-		}
-		if !seen.ChildVisit.Equal(state.BacklogSince) {
+		if seen.ChildStatus == "backlog" && !seen.ChildVisit.Equal(state.BacklogSince) {
 			return workflowDecision{}, blocked("child %s changed columns; retry it explicitly", state.Order[state.Index])
 		}
-		state.Phase = awaitingChild
+		phase, err := state.Phase.transition(ctx, activateChildEvent)
+		if err != nil {
+			return workflowDecision{}, err
+		}
+		state.Phase = phase
+		if seen.ChildStatus != "backlog" {
+			return workflowDecision{State: state, Changed: true}, nil
+		}
 		return claim(state.Order[state.Index], "backlog", authorColumn, seen.ChildVisit), nil
 	case awaitingChild:
 		if seen.ChildStatus == "backlog" {
@@ -555,7 +555,7 @@ func (d *dispatcher) workflowParent(ctx context.Context, id string, children []s
 				return result, fmt.Errorf("workflow intent names a task other than its parent or current child")
 			}
 		}
-		decision, err := nextWorkflow(*state, seen)
+		decision, err := nextWorkflow(ctx, *state, seen)
 		if err != nil {
 			return result, err
 		}
