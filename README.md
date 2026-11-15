@@ -35,7 +35,7 @@ step with the column graph written down in
    dispatcher waits up to 20 seconds for the worker to acknowledge acquiring
    its lock before reporting a successful launch. A competing worker is
    skipped; an absent executable or missing acknowledgment is an error.
-   The accepted stage outlives the dispatcher and receives the task id and repo.
+   The accepted stage outlives the dispatcher and receives the task id, repo and durable command ID. Workers without the command protocol are refused before execution.
 
 `POST /reconcile`, behind the same signature, checks active and human-review
 cards for a merged PR and moves them to Done. It uses the newest matching
@@ -43,15 +43,28 @@ same-repository PR, re-reads the card before updating, and verifies the result.
 Backlog and Done remain untouched. Kaneo has no conditional update operation;
 a concurrent edit between the final read and PUT can still be overwritten.
 
-Workers post `Work started: stage-author`, `stage-test`, or `stage-merge`
-comments on the card once they hold their pod lock and reach actual task work.
-The reconciler uses Kaneo's server timestamp for this durable start signal:
+Workers execute only dispatcher-issued commands. They report to the synchronous
+`POST /worker-events` endpoint, authenticated with the mounted Kaneo API key and
+bound to a random command ID. A valid response is HTTP 200 with a matching v1
+acknowledgment; an old dispatcher's catch-all 202 is rejected. Workers retain
+read-only Kaneo context access, but all board changes, notes, mentions and PR
+links go through the dispatcher. They never scan the board or other repositories
+for work.
 
-- Without a start signal for the current stage and column visit, retry after
-  `RECONCILE_UNCLAIMED` (15m) from the last column move or task creation.
-- With a start signal, allow `RECONCILE_STALE` (4h) from the latest start.
-- A later column move invalidates the previous signal, even if the card
-  returns to the same stage. Ordinary comments do not extend either window.
+Commands persist in the runtime `kaneo-commands` ConfigMap. A started report
+moves the ticket through the lifecycle FSM and records the start timestamp only
+after the command's stage, repository, dependencies and column visit are checked.
+
+- An issued command without a start signal can be replaced after
+  `RECONCILE_UNCLAIMED` (15m).
+- A running command gets `RECONCILE_STALE` (4h) before replacement is eligible.
+- Moving a card invalidates the old command's visit, even when it returns to the
+  same column. A replacement command invalidates the previous command ID.
+- Transitional claims and uncertain GitHub merges require explicit recovery;
+  time passing never proves a merge successful.
+
+Historical work-start comments are still recognized during rollout. New workers
+report starts to the dispatcher rather than posting their own receipt comments.
 
 The CronJob sweeps every minute, so an unclaimed card is normally eligible
 within 15–16 minutes. Busy pods remain protected by their lock. Slow sweeps
@@ -61,6 +74,69 @@ to resume. Existing PRs or integration statuses do not suppress retries:
 the stage owns recovery of unfinished work. Unmerged human-review cards remain parked. Busy workers are
 reported as skipped, and failed launches as errors. `POST /reconcile?dry`
 performs reads only. The `kaneo-reconcile` CronJob remains the caller.
+
+## Board and command state machines
+
+`looplab/fsm` owns all automated column transitions in `ticket_fsm.go`, including
+worker starts/outcomes, child activation, parent completion and observed merges.
+The command FSM owns `issued → starting → running → reporting → finished`.
+Guards and durable compare-and-swap writes run outside FSM callbacks.
+
+![Ticket lifecycle](docs/ticket-fsm.png)
+
+![Worker commands](docs/command-fsm.png)
+
+Kaneo commits manual UI/CLI changes before sending a webhook. The operator
+observation FSM accepts all seven known destinations, including pausing and
+reopening work; it cannot veto or undo a user's saved drag. Automation rereads
+the card and applies its own gates. [Operator transition graph](docs/operator-fsm.png).
+`make graph` uses the library's `fsm.Visualize` on the production factories for
+all four graphs, including the parent queue below.
+
+Before a merge or revert, workers request authorization for the exact assigned
+PR and reviewed head. Merge authorization is persisted before GitHub is called.
+The card stays Mergeable while the worker checks runs for the exact merge commit
+and base branch; only verified success reports Done. Missing/unknown CI stays
+held. Reconciliation and dependency checks cannot turn an unverified commanded
+merge into completion, even after four hours. A human's separately merged PR
+can still be reconciled after default-branch verification.
+
+Revert authorization records the original PR as invalidated *before* GitHub is
+called. This survives a lost final report. A confirmed revert returns the card
+to To Do; the invalidated PR cannot release dependencies. Replacement work needs
+a newer qualifying PR. The worker verifies/compensates only its command's PR,
+never a daily list of unrelated merges.
+
+### Recovering an uncertain command
+
+Command and move intent entries use the task ID and `move.<task-id>` keys in
+`kaneo-commands`. Revert evidence uses `reverted.<task-id>` and must survive
+command replacement. Kubernetes resource versions protect competing writers;
+unrelated metadata conflicts are retried without replaying a board PUT.
+
+A crash or read failure after saving `starting`/`reporting` deliberately holds
+that command. Moving the card alone does not clear this uncertainty:
+
+1. Pause the card and stop its old worker (or confirm it has exited and released
+   its pod lock). Inspect the card activity and the command's exact PR/head,
+   merge commit, CI runs, and any revert PR. Save a copy of `kaneo-commands`.
+2. Use `kubectl edit configmap kaneo-commands -n claude-pods`. For work that did
+   not merge, remove only that task's command and `move.<task-id>` entries, then
+   explicitly return the card to the appropriate work column. Preserve other
+   tasks and every `reverted.*` record.
+3. For a confirmed, healthy merge, retain its PR/head binding and set the task's
+   command to `phase: finished`, `outcome: merge-succeeded`; then reconcile or
+   mark Done. Do this only after checking CI for the actual merge commit.
+4. For an actual revert, preserve `reverted.<task-id>`, remove that task's command
+   and movement claim, and return it to To Do for replacement work. A tentative
+   revert invalidation may be removed only after proving no revert landed and
+   verifying the original merge remains the intended healthy result.
+
+The ConfigMaps are runtime data, not Argo-managed manifests. Their size is
+bounded by Kubernetes' ConfigMap limit; archive finished records deliberately
+before growing this beyond a small board. Never delete unresolved claims or
+revert evidence as routine cleanup. Kaneo still lacks conditional writes, so a
+manual edit racing the final API read/write remains a limitation.
 
 ## Sequential subtasks
 
@@ -199,34 +275,19 @@ to: `http://kaneo-dispatcher.claude-pods.svc.cluster.local:8080`.
 `deploy/` is rendered from `config.yaml`. Adjust it with `patches` there,
 keyed by resource kind, rather than editing the manifests. `homelabctl register` publishes `deploy/kaneo-dispatcher/argocd.json` into the homelab repository.
 
-### First deployment handoff
+### Command protocol rollout
 
-This PR transfers the existing Deployment, Service and Ingress from the
-`claude-pods` Argo Application to `kaneo-dispatcher`. A normal automated sync
-could prune them before the replacement image or Vault role is ready.
+The companion homelab worker PR and this service must be deployed together, with
+existing stage runs quiesced first. Deploy the dispatcher endpoint and RBAC,
+then roll every session pod to the companion worker image. The new launcher
+checks the protocol marker before executing an old worker; new workers reject
+old launches without a command ID. There is no direct-Kaneo fallback.
 
-1. Deploy the companion homelab worker change (launch acknowledgment and durable
-   work-start comments) before switching the dispatcher. Confirm every session
-   pod uses that worker image; older workers cannot acknowledge launches.
-   Publish the service image from this branch using the workflow's manual
-   trigger. It publishes a SHA tag; verify that image before selecting it for
-   the first rollout. The default branch publishes `latest` after merging.
-2. From this directory, run `homelabctl vault --apply` with an authenticated
-   Vault administrator. This creates the new role for ServiceAccount
-   `kaneo-dispatcher`; retain the existing `claude-pods` policy and role.
-3. Pause automated sync on `claude-pods` and the root app while transferring
-   ownership. Record their existing sync settings first. Merge, then sync the
-   new Application with the verified image digest. Confirm the ExternalSecret
-   is Ready, the Deployment is Available and both Service ports work.
-4. Confirm Argo tracking on Deployment, Service and Ingress now names
-   `kaneo-dispatcher` before allowing the old Application to prune. Restore
-   the recorded sync settings and confirm both Applications are healthy.
-5. Verify a signed dry reconcile and fake tickets through the complete board
-   and worker pipeline, including recovery after an interrupted stage. Keep
-   the card open until these checks pass.
-
-If the new deployment fails, stop its automatic sync before restoring the
-previous Deployment/Service/Ingress from the pre-merge revision. Preserve the
-Kaneo webhook URL and existing secrets throughout the handoff.
+Verify the worker image on every pod (the StatefulSet partition may retain old
+images), the endpoint's strict v1 acknowledgment, signed dry reconciliation, and
+a disposable task through author/test/merge before enabling real work. Exercise
+a pause, a lost report, and an unclaimed retry. Preserve both runtime ConfigMaps
+across rollbacks; old dispatcher/worker versions do not understand command state.
+These changes have not been deployed or live-tested by this PR.
 
 Scaffold provenance: generated with `homelabctl init kaneo-dispatcher --runtime go-service --no-spec`; untouched output is commit `521e1db`. Placeholder route/client-floor tests were replaced with webhook and reconciliation tests. Set `HOMELAB_CHECKOUT` when running tests to verify worker lock and sleep contracts across repositories.

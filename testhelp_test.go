@@ -178,6 +178,7 @@ func (s *stubKaneo) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			s.tasks[id] = task
+			s.activity[id] = append(s.activity[id], map[string]string{"type": "status_changed", "createdAt": time.Now().UTC().Format(time.RFC3339Nano)})
 		}
 		_ = json.NewEncoder(w).Encode(s.tasks[id])
 

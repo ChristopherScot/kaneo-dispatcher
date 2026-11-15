@@ -1,0 +1,12 @@
+digraph fsm {
+    "issued" -> "starting" [ label = "start" ];
+    "reporting" -> "finished" [ label = "reported" ];
+    "running" -> "reporting" [ label = "report" ];
+    "starting" -> "running" [ label = "started" ];
+
+    "finished";
+    "issued" [color = "red"];
+    "reporting";
+    "running";
+    "starting";
+}

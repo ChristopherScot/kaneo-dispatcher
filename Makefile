@@ -39,12 +39,19 @@ test:
 .PHONY: graph
 graph:
 	mkdir -p docs
-	go run workflow_graph.go workflow_fsm.go > docs/workflow-fsm.dot
+	go run workflow_graph.go workflow_fsm.go ticket_fsm.go > docs/workflow-fsm.dot
 	dot -Tpng -Grankdir=LR -Gbgcolor=white -Gpad=0.35 -Gdpi=144 \
 		-Glabel="Sequential child workflow" -Glabelloc=t -Gfontname=Helvetica -Gfontsize=20 \
 		-Nfontname=Helvetica -Nfontsize=13 -Nstyle=rounded \
 		-Efontname=Helvetica -Efontsize=11 \
 		docs/workflow-fsm.dot -o docs/workflow-fsm.png
+
+	for graph in ticket command operator; do \
+		go run workflow_graph.go workflow_fsm.go ticket_fsm.go $$graph > docs/$$graph-fsm.dot; \
+		dot -Tpng -Grankdir=LR -Gbgcolor=white -Gpad=0.35 -Gdpi=110 \
+		-Nfontname=Helvetica -Nfontsize=13 -Efontname=Helvetica -Efontsize=11 \
+		docs/$$graph-fsm.dot -o docs/$$graph-fsm.png || exit 1; \
+	done
 
 .PHONY: run
 run:

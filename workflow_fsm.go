@@ -2,8 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
-	"fmt"
 
 	"github.com/looplab/fsm"
 )
@@ -32,17 +30,9 @@ func newWorkflowFSM(initial workflowPhase) *fsm.FSM {
 }
 
 func (phase workflowPhase) transition(ctx context.Context, event string) (workflowPhase, error) {
-	machine := newWorkflowFSM(phase)
-	err := machine.Event(ctx, event)
-	// An already-completed child can advance the cursor before activation was
-	// observed. The library validates that ready -> ready event but reports it
-	// as NoTransitionError because the phase itself stays unchanged.
-	var unchanged fsm.NoTransitionError
-	if errors.As(err, &unchanged) && unchanged.Err == nil {
-		err = nil
-	}
+	next, err := fsmEvent(ctx, newWorkflowFSM(phase), event)
 	if err != nil {
-		return phase, fmt.Errorf("workflow event %s: %w", event, err)
+		return phase, err
 	}
-	return workflowPhase(machine.Current()), nil
+	return workflowPhase(next), nil
 }

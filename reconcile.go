@@ -136,11 +136,18 @@ func (d *dispatcher) reconcileCard(ctx context.Context, column string, c card, d
 	if !ok {
 		return cardResult{skipped, c.name() + ": card needs exactly one repo: label"}, nil
 	}
-	pr, err := d.taskPullRequest(ctx, repo, c.ID)
+	pr, err := d.mergedWork(ctx, c.ID)
 	if err != nil {
 		return cardResult{}, err
 	}
-	if pr != nil && pr.MergedAt != nil {
+	if pr != nil {
+		verified, err := d.mergeVerified(ctx, c.ID, pr.Number)
+		if err != nil {
+			return cardResult{}, err
+		}
+		if !verified {
+			return cardResult{skipped, c.name() + ": commanded merge is awaiting verification or recovery"}, nil
+		}
 		changed, err := d.completeMergedTask(ctx, c.ID, column, b, dryRun)
 		if err != nil {
 			return cardResult{}, err
@@ -162,6 +169,9 @@ func (d *dispatcher) reconcileCard(ctx context.Context, column string, c card, d
 		return cardResult{}, err
 	}
 	work, err := d.taskWork(ctx, c.ID, st)
+	if err == nil {
+		work, err = d.commandWork(ctx, c.ID, st, work)
+	}
 	if err != nil {
 		return cardResult{}, err
 	}
@@ -293,6 +303,7 @@ func (d *dispatcher) runSweep(ctx context.Context, dryRun bool) {
 // Only the newest PR from this repository and exact task branch can finish
 // a card. Paginate so an old merge cannot hide a newer use of the branch.
 type pullRequest struct {
+	Body     string  `json:"body"`
 	Number   int     `json:"number"`
 	MergedAt *string `json:"merged_at"`
 	Base     struct {
@@ -302,6 +313,7 @@ type pullRequest struct {
 		} `json:"repo"`
 	} `json:"base"`
 	Head struct {
+		SHA  string `json:"sha"`
 		Ref  string `json:"ref"`
 		Repo struct {
 			FullName string `json:"full_name"`
@@ -344,7 +356,11 @@ func (d *dispatcher) completeMergedTask(ctx context.Context, id, column string, 
 	if done != 1 {
 		return false, fmt.Errorf("project must have exactly one Done column")
 	}
-	return d.moveTask(ctx, id, column, "done", dry)
+	work, err := d.taskWork(ctx, id, stage{})
+	if err != nil {
+		return false, err
+	}
+	return d.moveTicket(ctx, id, column, "merge-observed", work.enteredAt, dry)
 }
 
 func (d *dispatcher) moveTask(ctx context.Context, id, column, target string, dry bool) (bool, error) {

@@ -133,27 +133,52 @@ func (d *dispatcher) completedWork(ctx context.Context, id string) (bool, error)
 	if err != nil || task.Status != "done" {
 		return false, err
 	}
-	repo, ok, err := d.repoForTask(ctx, id)
-	if err != nil {
+	pr, err := d.mergedWork(ctx, id)
+	if err != nil || pr == nil {
 		return false, err
 	}
+	return d.mergeVerified(ctx, id, pr.Number)
+}
+
+// mergedWork returns only qualifying, non-invalidated default-branch merges.
+func (d *dispatcher) mergedWork(ctx context.Context, id string) (*pullRequest, error) {
+	repo, ok, err := d.repoForTask(ctx, id)
+	if err != nil {
+		return nil, err
+	}
 	if !ok {
-		return false, blocked("%s needs exactly one repo: label", id)
+		return nil, blocked("%s needs exactly one repo: label", id)
 	}
 	pr, err := d.taskPullRequest(ctx, repo, id)
 	if err != nil || pr == nil || pr.MergedAt == nil {
-		return false, err
+		return nil, err
+	}
+	cm, err := d.commandStore(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if raw := cm.Data["reverted."+id]; raw != "" {
+		var invalidated int
+		if err := json.Unmarshal([]byte(raw), &invalidated); err != nil {
+			return nil, err
+		}
+		if pr.Number <= invalidated {
+			return nil, nil
+		}
 	}
 	var repository struct {
 		DefaultBranch string `json:"default_branch"`
 	}
 	if err := d.github(ctx, "/repos/"+repo, &repository); err != nil {
-		return false, err
+		return nil, err
 	}
 	if repository.DefaultBranch == "" {
-		return false, fmt.Errorf("repository %s has no default branch", repo)
+		return nil, fmt.Errorf("repository %s has no default branch", repo)
 	}
-	return pr.Base.Ref == repository.DefaultBranch && strings.EqualFold(pr.Base.Repo.FullName, repo), nil
+	if pr.Base.Ref != repository.DefaultBranch || !strings.EqualFold(pr.Base.Repo.FullName, repo) {
+		return nil, nil
+	}
+	return pr, nil
 }
 
 // prerequisites returns the full dependency closure, ordered before their
@@ -313,7 +338,7 @@ func loadWorkflow(ctx context.Context, maps typedcorev1.ConfigMapInterface, pare
 
 // Kubernetes resourceVersion is the compare-and-swap. Conflicts stop this
 // attempt before touching Kaneo; the next webhook/sweep reads the winner.
-func saveWorkflow(ctx context.Context, maps typedcorev1.ConfigMapInterface, cm *corev1.ConfigMap, parent string, state *workflow) error {
+func saveState(ctx context.Context, maps typedcorev1.ConfigMapInterface, cm *corev1.ConfigMap, parent string, state any) error {
 	raw, err := json.Marshal(state)
 	if err != nil {
 		return err
@@ -577,14 +602,21 @@ func (d *dispatcher) workflowParent(ctx context.Context, id string, children []s
 		if dry {
 			return cardResult{skipped, id + ": sequential workflow [dry-run]"}, nil
 		}
-		if err := saveWorkflow(ctx, d.workflows, cm, id, &decision.State); err != nil {
+		if err := saveState(ctx, d.workflows, cm, id, &decision.State); err != nil {
 			return result, err
 		}
 		if decision.Move == nil {
 			continue
 		}
 		move := decision.Move
-		ok, err := d.moveTask(ctx, move.Task, move.From, move.To, false)
+		event := "child-queued"
+		if move.Task == id {
+			event = "parent-started"
+			if move.To == "done" {
+				event = "parent-completed"
+			}
+		}
+		ok, err := d.moveTicket(ctx, move.Task, move.From, event, move.Visit, false)
 		if err != nil {
 			return result, err
 		}

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path"
 	"slices"
 	"strings"
 	"sync"
@@ -24,7 +25,7 @@ import (
 func workflowStore(t *testing.T) typedcorev1.ConfigMapInterface {
 	t.Helper()
 	var mu sync.Mutex
-	var stored *corev1.ConfigMap
+	storedMaps := map[string]*corev1.ConfigMap{}
 	version := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
@@ -34,6 +35,8 @@ func workflowStore(t *testing.T) typedcorev1.ConfigMapInterface {
 			w.WriteHeader(code)
 			_ = json.NewEncoder(w).Encode(map[string]any{"kind": "Status", "apiVersion": "v1", "status": "Failure", "reason": reason, "code": code})
 		}
+		name := path.Base(r.URL.Path)
+		stored := storedMaps[name]
 		switch r.Method {
 		case http.MethodGet:
 			if stored == nil {
@@ -47,6 +50,7 @@ func workflowStore(t *testing.T) typedcorev1.ConfigMapInterface {
 				fail(400, "BadRequest")
 				return
 			}
+			stored = storedMaps[cm.Name]
 			if r.Method == http.MethodPost && stored != nil {
 				fail(409, "AlreadyExists")
 				return
@@ -58,6 +62,7 @@ func workflowStore(t *testing.T) typedcorev1.ConfigMapInterface {
 			version++
 			cm.ResourceVersion = fmt.Sprint(version)
 			stored = &cm
+			storedMaps[cm.Name] = stored
 		default:
 			fail(405, "MethodNotAllowed")
 			return
@@ -274,7 +279,7 @@ func TestWorkflowStoreRejectsCompetingSelections(t *testing.T) {
 		t.Fatal(err)
 	}
 	state := &workflow{Phase: readyChild, Order: []string{"a", "b"}}
-	if err := saveWorkflow(ctx, maps, cm, "parent", state); err != nil {
+	if err := saveState(ctx, maps, cm, "parent", state); err != nil {
 		t.Fatal(err)
 	}
 	a, first, err := loadWorkflow(ctx, maps, "parent")
@@ -286,10 +291,10 @@ func TestWorkflowStoreRejectsCompetingSelections(t *testing.T) {
 		t.Fatal(err)
 	}
 	first.Index = 1
-	if err := saveWorkflow(ctx, maps, a, "parent", first); err != nil {
+	if err := saveState(ctx, maps, a, "parent", first); err != nil {
 		t.Fatal(err)
 	}
-	if err := saveWorkflow(ctx, maps, b, "parent", second); !apierrors.IsConflict(err) {
+	if err := saveState(ctx, maps, b, "parent", second); !apierrors.IsConflict(err) {
 		t.Fatalf("stale dispatcher overwrote selection: %v", err)
 	}
 	_, saved, err := loadWorkflow(ctx, maps, "parent")
@@ -306,7 +311,7 @@ func TestConcurrentActivationIssuesOnlyOneKaneoPut(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := saveWorkflow(ctx, f.d.workflows, cm, "parent", &workflow{Phase: readyChild, Order: []string{"a", "b", "c"}}); err != nil {
+	if err := saveState(ctx, f.d.workflows, cm, "parent", &workflow{Phase: readyChild, Order: []string{"a", "b", "c"}}); err != nil {
 		t.Fatal(err)
 	}
 	entered, release := make(chan struct{}, 2), make(chan struct{})

@@ -220,6 +220,7 @@ type delivery struct {
 	Task  card   `json:"task"`
 	Data  struct {
 		NewStatus string `json:"newStatus"`
+		OldStatus string `json:"oldStatus"`
 	} `json:"data"`
 }
 
@@ -243,6 +244,14 @@ func (d *dispatcher) webhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	column := ev.Data.NewStatus
+	previous := ev.Data.OldStatus
+	if previous == "" {
+		previous = column
+	}
+	if _, err := fsmEvent(r.Context(), newObservationFSM(previous), "observe-"+column); err != nil {
+		slog.Warn("unknown board transition", "err", err)
+		return
+	}
 	st, ok := routes[column]
 	if !ok {
 		// Inert columns are logged, not dropped: this is the audit trail
@@ -367,11 +376,15 @@ func (d *dispatcher) runStage(ctx context.Context, repo string, st stage, c card
 	if busy {
 		return errPodBusy
 	}
+	command, err := d.issueCommand(ctx, c.ID, repo, column, st, work)
+	if err != nil {
+		return err
+	}
 	slog.Info("start", "task", c.name(), "repo", repo, "pod", pod, "script", path.Base(st.script))
 	// The worker acknowledges its lock before continuing detached.
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	rc, err := d.exec(ctx, pod, []string{"sh", "-c", launchLine, st.script, c.ID, repo})
+	rc, err := d.exec(ctx, pod, []string{"sh", "-c", launchLine, st.script, c.ID, repo, command.ID})
 	if err != nil {
 		return fmt.Errorf("launch in %s: %w", pod, err)
 	}

@@ -1,12 +1,13 @@
-# $0 is the stage script, $1 the task id, $2 the repository.
+# $0 is the stage script, $1 the task id, $2 the repository, $3 the command ID.
 # Success means the worker sourced its preamble and acquired its pod lock.
 set -eu
 [ -x "$0" ] || { echo "stage is not executable" >&2; exit 1; }
+grep -qx '# dispatcher-command-protocol: 1' "$0" || { echo "worker does not support dispatcher commands" >&2; exit 1; }
 command -v setsid >/dev/null
 command -v nohup >/dev/null
 dir=$(mktemp -d /tmp/kaneo-launch.XXXXXX)
 trap 'rm -rf "$dir"' EXIT
-NIGHTLY_LAUNCH_ACK="$dir/ack" setsid --wait nohup "$0" "$1" "$2" >/dev/null 2>&1 </dev/null &
+NIGHTLY_LAUNCH_ACK="$dir/ack" setsid --wait nohup "$0" "$1" "$2" "${3:-}" >/dev/null 2>&1 </dev/null &
 pid=$!
 check_ack() {
   [ -f "$dir/ack" ] || return 0
