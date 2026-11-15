@@ -1,0 +1,163 @@
+package main
+
+// Specless variant, scaffolded by `homelabctl init --no-spec` for a
+// service whose shape openapi cannot usefully express - a proxy, a
+// websocket endpoint, anything serving HTML or wanting a catch-all.
+// There is no openapi.yml, no generated api/ and no clients.
+//
+// This file is YOURS to edit. Two things below are load-bearing:
+//
+//   - /health exists here because nothing else creates it; without it
+//     the readinessProbe hits a pod that never becomes ready.
+//   - metrics are labelled by ROUTE PATTERN, never by request path.
+//     Without a generated router rejecting unrouted paths, a raw URL as
+//     a label is unbounded cardinality and writes caller-controlled
+//     strings into the monitoring stack.
+
+import (
+	"encoding/json"
+	"log/slog"
+	"net/http"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"golang.org/x/mod/semver"
+)
+
+var (
+	requests = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "http_requests_total",
+		Help: "Requests by route, method and status.",
+	}, []string{"route", "method", "status"})
+
+	latency = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "http_request_duration_seconds",
+		Help:    "Request latency by route and method.",
+		Buckets: prometheus.DefBuckets,
+	}, []string{"route", "method"})
+)
+
+// statusRecorder captures the status code, which http.ResponseWriter
+// does not expose after the fact.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	r.status = code
+	r.ResponseWriter.WriteHeader(code)
+}
+
+// observe takes the route name as an argument rather than reading the
+// request path, so a label can only ever be a string written in this file.
+func observe(route string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, req *http.Request) {
+		if tooOld(req) {
+			// 410 Gone, not 429: generated clients retry 429 and 5xx and
+			// nothing else, so 410 stops them dead.
+			slog.Warn("refusing a client below the floor",
+				"route", route,
+				"client", clientName(req),
+				"client_version", req.Header.Get(ClientVersionHeader),
+				"min_version", minVersion)
+			http.Error(w, "this client is too old; reload or upgrade", http.StatusGone)
+			return
+		}
+
+		start := time.Now()
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		next(rec, req)
+
+		elapsed := time.Since(start)
+		status := strconv.Itoa(rec.status)
+		requests.WithLabelValues(route, req.Method, status).Inc()
+		latency.WithLabelValues(route, req.Method).Observe(elapsed.Seconds())
+
+		slog.Info("request",
+			"method", req.Method,
+			"route", route,
+			"status", rec.status,
+			"client", clientName(req),
+			"client_version", req.Header.Get(ClientVersionHeader),
+			// Float milliseconds: elapsed.Milliseconds() truncates and a
+			// handler serving from memory logs duration_ms=0.
+			"duration_ms", float64(elapsed.Nanoseconds())/1e6)
+	}
+}
+
+// No X- prefix: RFC 6648 deprecated it in 2012.
+const (
+	ClientNameHeader    = "Client-Name"
+	ClientVersionHeader = "Client-Version"
+)
+
+// minVersion is the oldest client this service answers, from MIN_VERSION.
+// Empty means no floor. Read at startup rather than compiled in, so
+// raising the floor is a config edit and a restart. If you drop this
+// floor, also delete scaffold_floor_test.go.
+var minVersion = os.Getenv("MIN_VERSION")
+
+// tooOld reports whether a caller is below the floor. FAILS OPEN on
+// unparseable versions and on a caller that sends no version - those are
+// curl, probes and scripts, not the stale client this exists to stop.
+//
+// Clients report a bare semver (npm forbids the leading v).
+func tooOld(r *http.Request) bool {
+	if minVersion == "" {
+		return false
+	}
+	got := r.Header.Get(ClientVersionHeader)
+	if got == "" {
+		return false
+	}
+	got, floor := "v"+got, "v"+strings.TrimPrefix(minVersion, "v")
+	if !semver.IsValid(got) || !semver.IsValid(floor) {
+		return false
+	}
+	return semver.Compare(got, floor) < 0
+}
+
+// clientName returns "unknown" rather than sniffing the user agent.
+func clientName(r *http.Request) string {
+	if n := r.Header.Get(ClientNameHeader); n != "" {
+		return n
+	}
+	return "unknown"
+}
+
+func writeJSON(w http.ResponseWriter, code int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		slog.Error("writing response", "err", err)
+	}
+}
+
+func handler() (http.Handler, error) {
+	mux := http.NewServeMux()
+
+	// The manifest's readiness and liveness probes hit /health.
+	// Deliberately NOT wrapped in observe: the kubelet probes it every
+	// few seconds, which would bury real traffic.
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
+
+	// The deployment's scrape annotation points here.
+	mux.Handle("GET /metrics", promhttp.Handler())
+
+	mux.HandleFunc("GET /{$}", observe("root", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{
+			"service": "kaneo-dispatcher",
+			"version": version,
+		})
+	}))
+
+	return mux, nil
+}

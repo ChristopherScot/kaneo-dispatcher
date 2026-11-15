@@ -1,0 +1,21 @@
+# yaml-language-server: $schema=config.schema.json
+# The single source of truth for this service. `homelabctl render`
+# regenerates every manifest from it, so change things here rather than
+# editing deploy/ by hand.
+name: kaneo-dispatcher
+team: me-myself-and-i
+runtime: go-service
+spec: false
+image:
+    repository: ghcr.io/christopherscot/kaneo-dispatcher
+port: 3000
+resources:
+    cpuRequest: 10m
+    memoryRequest: 32Mi
+    memoryLimit: 64Mi
+hardened: true
+metrics: true
+
+# secrets:
+#   vaultPath: <name>/config      # one Vault path per service
+#   keys: [SOME_TOKEN]
