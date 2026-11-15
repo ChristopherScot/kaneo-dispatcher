@@ -91,7 +91,7 @@ func TestRoleNamesTheSetTheWakeScales(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	names := regexp.MustCompile(`resourceNames: \["([^"]*)"\]`).FindAllSubmatch(src, -1)
+	names := regexp.MustCompile(`resources: \["statefulsets(?:/scale)?"\]\s+resourceNames: \["([^"]*)"\]`).FindAllSubmatch(src, -1)
 	if len(names) == 0 {
 		t.Fatal("rbac.yaml scopes nothing by name; the scale grant must be scoped to " + sessionSet)
 	}

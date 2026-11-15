@@ -1,0 +1,32 @@
+digraph fsm {
+    "backlog" -> "to-do" [ label = "child-queued" ];
+    "in-progress" -> "needs-human-review" [ label = "author-blocked" ];
+    "in-progress" -> "backlog" [ label = "author-failed" ];
+    "in-progress" -> "in-progress" [ label = "author-started" ];
+    "in-progress" -> "in-review" [ label = "author-succeeded" ];
+    "in-progress" -> "done" [ label = "merge-observed" ];
+    "in-progress" -> "done" [ label = "parent-completed" ];
+    "in-review" -> "done" [ label = "merge-observed" ];
+    "in-review" -> "needs-human-review" [ label = "test-blocked" ];
+    "in-review" -> "to-do" [ label = "test-failed" ];
+    "in-review" -> "in-review" [ label = "test-started" ];
+    "in-review" -> "mergeable" [ label = "test-succeeded" ];
+    "mergeable" -> "needs-human-review" [ label = "merge-blocked" ];
+    "mergeable" -> "to-do" [ label = "merge-failed" ];
+    "mergeable" -> "done" [ label = "merge-observed" ];
+    "mergeable" -> "to-do" [ label = "merge-reverted" ];
+    "mergeable" -> "mergeable" [ label = "merge-started" ];
+    "mergeable" -> "done" [ label = "merge-succeeded" ];
+    "needs-human-review" -> "done" [ label = "merge-observed" ];
+    "to-do" -> "in-progress" [ label = "author-started" ];
+    "to-do" -> "done" [ label = "merge-observed" ];
+    "to-do" -> "in-progress" [ label = "parent-started" ];
+
+    "backlog" [color = "red"];
+    "done";
+    "in-progress";
+    "in-review";
+    "mergeable";
+    "needs-human-review";
+    "to-do";
+}

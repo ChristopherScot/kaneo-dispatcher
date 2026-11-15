@@ -16,6 +16,7 @@ help:
 	@echo
 	@echo "  make build      compile"
 	@echo "  make test       vet and tests (what CI runs)"
+	@echo "  make graph      generate the FSM Graphviz DOT and PNG"
 	@echo "  make run        run it on :$(PORT)"
 	@echo "  make regen      regenerate code derived from the spec"
 	@echo "  make clean      remove build output"
@@ -34,6 +35,23 @@ build:
 test:
 	go vet ./...
 	go test -race ./...
+
+.PHONY: graph
+graph:
+	mkdir -p docs
+	go run workflow_graph.go workflow_fsm.go ticket_fsm.go > docs/workflow-fsm.dot
+	dot -Tpng -Grankdir=LR -Gbgcolor=white -Gpad=0.35 -Gdpi=144 \
+		-Glabel="Sequential child workflow" -Glabelloc=t -Gfontname=Helvetica -Gfontsize=20 \
+		-Nfontname=Helvetica -Nfontsize=13 -Nstyle=rounded \
+		-Efontname=Helvetica -Efontsize=11 \
+		docs/workflow-fsm.dot -o docs/workflow-fsm.png
+
+	for graph in ticket command operator; do \
+		go run workflow_graph.go workflow_fsm.go ticket_fsm.go $$graph > docs/$$graph-fsm.dot; \
+		dot -Tpng -Grankdir=LR -Gbgcolor=white -Gpad=0.35 -Gdpi=110 \
+		-Nfontname=Helvetica -Nfontsize=13 -Efontname=Helvetica -Efontsize=11 \
+		docs/$$graph-fsm.dot -o docs/$$graph-fsm.png || exit 1; \
+	done
 
 .PHONY: run
 run:

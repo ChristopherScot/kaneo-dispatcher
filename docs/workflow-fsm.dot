@@ -1,0 +1,11 @@
+digraph fsm {
+    "awaiting-child" -> "ready-child" [ label = "child-merged" ];
+    "awaiting-child" -> "children-complete" [ label = "last-child-merged" ];
+    "ready-child" -> "awaiting-child" [ label = "child-activated" ];
+    "ready-child" -> "ready-child" [ label = "child-merged" ];
+    "ready-child" -> "children-complete" [ label = "last-child-merged" ];
+
+    "awaiting-child";
+    "children-complete";
+    "ready-child" [color = "red"];
+}

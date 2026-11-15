@@ -120,6 +120,7 @@ type stubKaneo struct {
 	mu        sync.Mutex
 	labels    map[string][]string // task id -> label names
 	labelErr  int                 // non-zero: answer every label lookup with this status
+	relations []taskRelation
 	activity  map[string][]map[string]string
 	board     any // what /task/tasks/{project} returns
 	hits      int
@@ -134,6 +135,15 @@ func (s *stubKaneo) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.hits++
 	w.Header().Set("Content-Type", "application/json")
 	switch {
+	case strings.HasPrefix(r.URL.Path, "/api/task-relation/"):
+		id := strings.TrimPrefix(r.URL.Path, "/api/task-relation/")
+		rels := []taskRelation{}
+		for _, rel := range s.relations {
+			if rel.Source == id || rel.Target == id {
+				rels = append(rels, rel)
+			}
+		}
+		_ = json.NewEncoder(w).Encode(rels)
 	case strings.HasPrefix(r.URL.Path, "/api/label/task/"):
 		if s.labelErr != 0 {
 			w.WriteHeader(s.labelErr)
@@ -168,6 +178,7 @@ func (s *stubKaneo) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			s.tasks[id] = task
+			s.activity[id] = append(s.activity[id], map[string]string{"type": "status_changed", "createdAt": time.Now().UTC().Format(time.RFC3339Nano)})
 		}
 		_ = json.NewEncoder(w).Encode(s.tasks[id])
 
@@ -200,6 +211,8 @@ func (s *stubGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch {
+	case strings.HasPrefix(r.URL.Path, "/repos/") && !strings.HasSuffix(r.URL.Path, "/pulls"):
+		_ = json.NewEncoder(w).Encode(map[string]string{"default_branch": "main"})
 	case strings.HasSuffix(r.URL.Path, "/pulls"):
 		prs := s.prs[r.URL.Query().Get("head")]
 		if prs == nil {
@@ -268,6 +281,7 @@ func newFixture(t *testing.T) *fixture {
 	t.Cleanup(func() { slog.SetDefault(prev) })
 
 	f.d = &dispatcher{
+		workflows:    workflowStore(t),
 		owner:        "TestOwner",
 		branchPrefix: "fix/",
 		project:      "proj",

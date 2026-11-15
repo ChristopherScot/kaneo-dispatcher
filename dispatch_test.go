@@ -106,7 +106,7 @@ func TestDispatchingColumnLaunchesTheStageInItsPod(t *testing.T) {
 	// positional arguments, so none is spliced into shell text. The repo
 	// is there because stage-author refuses a named task without one.
 	want := []string{"sh", "-c", launchLine, "/usr/local/bin/stage-author", "t2", "TestOwner/testrepo"}
-	if !slices.Equal(l[0].argv, want) {
+	if len(l[0].argv) != len(want)+1 || !slices.Equal(l[0].argv[:len(want)], want) || l[0].argv[len(want)] == "" {
 		t.Errorf("argv = %q, want %q", l[0].argv, want)
 	}
 	f.wantLog("msg=start task=t2 repo=TestOwner/testrepo pod=claude-session-0 script=stage-author")
@@ -322,7 +322,11 @@ func TestLabelLookupFailureIsAnErrorNotNoLabel(t *testing.T) {
 // rather than an empty list.
 func TestNonArrayLabelAnswerIsAnError(t *testing.T) {
 	f := newFixture(t)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/task-relation/") {
+			_, _ = io.WriteString(w, `[]`)
+			return
+		}
 		_, _ = io.WriteString(w, `{"error":"unauthorized"}`)
 	}))
 	t.Cleanup(srv.Close)

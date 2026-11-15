@@ -110,7 +110,7 @@ func TestStrandedInProgressCardIsHandedBackToTheAuthor(t *testing.T) {
 	}
 	l := f.pods.launches()
 	want := []string{"sh", "-c", launchLine, "/usr/local/bin/stage-author", "t1", "TestOwner/testrepo"}
-	if len(l) != 1 || l[0].pod != "claude-session-0" || !slices.Equal(l[0].argv, want) {
+	if len(l) != 1 || l[0].pod != "claude-session-0" || (len(l[0].argv) != len(want)+1 || !slices.Equal(l[0].argv[:len(want)], want) || l[0].argv[len(want)] == "") {
 		t.Errorf("launches = %v, want the author stage in claude-session-0 with t1 and its repo", l)
 	}
 	if hits := f.github.calls(); len(hits) != 1 {
@@ -223,7 +223,7 @@ func TestMergedPullRequestEndsTheStoryInAnyColumn(t *testing.T) {
 			f := newFixture(t)
 			f.stale(column)
 			f.d.repos = map[string][]string{"0": {}, "1": {}, "2": {}}
-			f.github.prs["TestOwner:fix/t1"] = []map[string]any{{"merged_at": "2026-11-01T00:00:00Z", "number": 1, "head": map[string]any{"sha": "abc", "ref": "fix/t1", "repo": map[string]string{"full_name": "TestOwner/testrepo"}}}}
+			f.github.prs["TestOwner:fix/t1"] = []map[string]any{{"merged_at": "2026-11-01T00:00:00Z", "number": 1, "base": map[string]any{"ref": "main", "repo": map[string]string{"full_name": "TestOwner/testrepo"}}, "head": map[string]any{"sha": "abc", "ref": "fix/t1", "repo": map[string]string{"full_name": "TestOwner/testrepo"}}}}
 			f.kaneo.tasks["t1"] = map[string]any{"id": "t1", "projectId": "proj", "status": column, "title": "keep me", "dueDate": nil}
 			s := f.reconcile(false)
 			if len(s.completed) != 1 || len(s.redispatched) != 0 {
@@ -354,6 +354,7 @@ func TestMergedCompletionGuards(t *testing.T) {
 			f.stale("in-progress")
 			pr := openPR("abc")[0]
 			pr["merged_at"] = "2026-11-01T00:00:00Z"
+			pr["base"] = map[string]any{"ref": "main", "repo": map[string]string{"full_name": "TestOwner/testrepo"}}
 			f.github.prs["TestOwner:fix/t1"] = []map[string]any{pr}
 			f.kaneo.tasks["t1"] = map[string]any{"id": "t1", "projectId": "proj", "status": "in-progress", "title": "preserve", "dueDate": nil}
 			switch mode {

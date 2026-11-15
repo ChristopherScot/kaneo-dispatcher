@@ -3,6 +3,7 @@ module github.com/ChristopherScot/kaneo-dispatcher
 go 1.27
 
 require (
+	github.com/looplab/fsm v1.0.4
 	github.com/prometheus/client_golang v1.25.0
 	k8s.io/api v0.31.14
 	k8s.io/apimachinery v0.31.14

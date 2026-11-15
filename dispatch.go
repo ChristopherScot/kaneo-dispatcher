@@ -18,6 +18,8 @@ import (
 	"sync"
 	"time"
 	"unicode"
+
+	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 )
 
 // A stage is which pod runs which script when a card lands in a column.
@@ -91,7 +93,8 @@ type dispatcher struct {
 	repos        map[string][]string // pod ordinal -> the owner/name repos it works
 	stale        time.Duration       // grace period after a worker starts
 	unclaimed    time.Duration       // retry delay when no worker has started
-	sweepMu      sync.Mutex          // prevent overlapping asynchronous sweeps
+	workflows    typedcorev1.ConfigMapInterface
+	sweepMu      sync.Mutex // prevent overlapping asynchronous sweeps
 	exec         execer
 	wake         waker
 	client       *http.Client
@@ -132,7 +135,7 @@ func fromEnv() (*dispatcher, error) {
 	if err != nil || unclaimed <= 0 {
 		return nil, fmt.Errorf("RECONCILE_UNCLAIMED must be a positive duration")
 	}
-	exec, wake, err := newPodClient(envOr("DISPATCH_NS", "claude-pods"))
+	exec, wake, workflows, err := newPodClient(envOr("DISPATCH_NS", "claude-pods"))
 	if err != nil {
 		return nil, err
 	}
@@ -147,13 +150,14 @@ func fromEnv() (*dispatcher, error) {
 		githubURL:    envOr("GITHUB_API_URL", "https://api.github.com"),
 		apiKey:       apiKey,
 		secret:       []byte(secret),
-		// GITHUB_TOKEN is deliberately not required: only the sweep uses
-		// it, and the webhook path must not depend on it. See github().
+		// Legacy standalone webhooks can launch without GitHub access.
+		// Workflow dependency/completion gates fail closed if it is unavailable.
 		ghToken:   os.Getenv("GITHUB_TOKEN"),
 		repos:     reposFromEnv(os.Environ()),
 		stale:     stale,
 		unclaimed: unclaimed,
 		exec:      exec,
+		workflows: workflows,
 		wake:      wake,
 		client:    &http.Client{Timeout: 30 * time.Second},
 	}, nil
@@ -216,6 +220,7 @@ type delivery struct {
 	Task  card   `json:"task"`
 	Data  struct {
 		NewStatus string `json:"newStatus"`
+		OldStatus string `json:"oldStatus"`
 	} `json:"data"`
 }
 
@@ -239,6 +244,14 @@ func (d *dispatcher) webhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	column := ev.Data.NewStatus
+	previous := ev.Data.OldStatus
+	if previous == "" {
+		previous = column
+	}
+	if _, err := fsmEvent(r.Context(), newObservationFSM(previous), "observe-"+column); err != nil {
+		slog.Warn("unknown board transition", "err", err)
+		return
+	}
 	st, ok := routes[column]
 	if !ok {
 		// Inert columns are logged, not dropped: this is the audit trail
@@ -264,6 +277,16 @@ func (d *dispatcher) detach(r *http.Request, work func(ctx context.Context)) {
 // dispatch runs the stage a column implies for one card, or logs one line
 // saying why not.
 func (d *dispatcher) dispatch(ctx context.Context, column string, st stage, c card) {
+	children, isParent, err := d.parentChildren(ctx, c.ID)
+	if err != nil {
+		slog.Error("read workflow", "task", c.ID, "err", err)
+		return
+	}
+	if isParent {
+		result, err := d.workflowParent(ctx, c.ID, children, false)
+		slog.Info("workflow", "task", c.ID, "result", result.detail, "err", err)
+		return
+	}
 	repo, skip, err := d.repoFor(ctx, c.ID, st)
 	if err != nil {
 		slog.Error("cannot read labels", "task", c.name(), "column", column, "err", err)
@@ -274,7 +297,7 @@ func (d *dispatcher) dispatch(ctx context.Context, column string, st stage, c ca
 		return
 	}
 	if err := d.runStage(ctx, repo, st, c, column); err != nil {
-		if errors.Is(err, errPodBusy) || errors.Is(err, errCardChanged) || errors.Is(err, errWorkStarted) {
+		if errors.Is(err, errPodBusy) || errors.Is(err, errCardChanged) || errors.Is(err, errWorkStarted) || errors.Is(err, errWorkflowBlocked) {
 			slog.Warn("skip", "task", c.name(), "column", column, "repo", repo, "reason", err)
 			return
 		}
@@ -311,6 +334,9 @@ var (
 
 // runStage wakes the pods, rechecks the card and waits for worker acceptance.
 func (d *dispatcher) runStage(ctx context.Context, repo string, st stage, c card, column string) error {
+	if err := d.workflowGate(ctx, c.ID); err != nil {
+		return err
+	}
 	// Wake every routed pod; the StatefulSet may be scaled to zero.
 	if err := d.wake(ctx); err != nil {
 		return fmt.Errorf("wake: %w", err)
@@ -339,6 +365,9 @@ func (d *dispatcher) runStage(ctx context.Context, repo string, st stage, c card
 	if !work.startedAt.IsZero() && time.Since(work.startedAt) < d.stale {
 		return errWorkStarted
 	}
+	if err := d.workflowGate(ctx, c.ID); err != nil {
+		return err
+	}
 	pod := st.pod()
 	busy, err := d.podIsBusy(ctx, pod)
 	if err != nil {
@@ -347,11 +376,15 @@ func (d *dispatcher) runStage(ctx context.Context, repo string, st stage, c card
 	if busy {
 		return errPodBusy
 	}
+	command, err := d.issueCommand(ctx, c.ID, repo, column, st, work)
+	if err != nil {
+		return err
+	}
 	slog.Info("start", "task", c.name(), "repo", repo, "pod", pod, "script", path.Base(st.script))
 	// The worker acknowledges its lock before continuing detached.
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	rc, err := d.exec(ctx, pod, []string{"sh", "-c", launchLine, st.script, c.ID, repo})
+	rc, err := d.exec(ctx, pod, []string{"sh", "-c", launchLine, st.script, c.ID, repo, command.ID})
 	if err != nil {
 		return fmt.Errorf("launch in %s: %w", pod, err)
 	}

@@ -6,8 +6,8 @@ name: kaneo-dispatcher
 team: me-myself-and-i
 runtime: go-service
 
-# A webhook receiver with two endpoints; there is no API for a consumer
-# to import, so server.go is hand-written and nothing is generated.
+# Webhooks, reconciliation and command-scoped worker reports use hand-written
+# routes in server.go; there is no generated client API.
 spec: false
 
 # Beside the session pods it execs into. The Role in rbac.yaml is
@@ -96,7 +96,8 @@ patches:
 # shared between two replicas. Nothing in this process guards a pod any
 # more: the scripts take a lock in the pod itself (take_pod_lock), so a
 # second dispatcher overlapping the first during a rollout can at worst
-# start a run that exits at once.
+# start a run that exits at once. Sequential workflow selections and move
+# claims are shared separately in the runtime kaneo-workflows ConfigMap.
 resources:
     cpuRequest: 10m
     memoryRequest: 32Mi
