@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -178,21 +179,37 @@ func TestWorkflowRejectsInvalidPlansAndRechecksAfterWake(t *testing.T) {
 			t.Fatalf("cycle did not fail closed: %v", err)
 		}
 	})
-	t.Run("paused during wake", func(t *testing.T) {
+	for _, mode := range []string{"paused", "manual"} {
+		t.Run(mode+" during wake", func(t *testing.T) {
+			f := workflowFixture(t)
+			_, err := f.d.workflowParent(ctx, "parent", []string{"a", "b", "c"}, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.d.wake = func(context.Context) error {
+				f.kaneo.mu.Lock()
+				defer f.kaneo.mu.Unlock()
+				if mode == "paused" {
+					f.kaneo.tasks["parent"]["status"] = "backlog"
+				} else {
+					f.kaneo.labels["parent"] = append(f.kaneo.labels["parent"], manualLabel)
+				}
+				return nil
+			}
+			err = f.d.runStage(ctx, "TestOwner/testrepo", routes[authorColumn], card{ID: "a"}, authorColumn)
+			if !errors.Is(err, errWorkflowBlocked) {
+				t.Fatalf("parent %s ignored: %v", mode, err)
+			}
+			f.wantNoLaunch()
+		})
+	}
+	t.Run("nested parent", func(t *testing.T) {
 		f := workflowFixture(t)
-		_, err := f.d.workflowParent(ctx, "parent", []string{"a", "b", "c"}, false)
-		if err != nil {
-			t.Fatal(err)
-		}
-		f.d.wake = func(context.Context) error {
-			f.kaneo.mu.Lock()
-			defer f.kaneo.mu.Unlock()
-			f.kaneo.tasks["parent"]["status"] = "backlog"
-			return nil
-		}
-		err = f.d.runStage(ctx, "TestOwner/testrepo", routes[authorColumn], card{ID: "a"}, authorColumn)
-		if !errors.Is(err, errWorkflowBlocked) {
-			t.Fatalf("parent pause ignored: %v", err)
+		f.kaneo.tasks["outer"] = map[string]any{"id": "outer", "projectId": "proj", "status": "backlog", "number": 9}
+		f.kaneo.relations = append(f.kaneo.relations, taskRelation{"outer", "parent", "subtask"})
+		f.signed("/", move("parent", authorColumn))
+		if f.kaneo.puts != 0 {
+			t.Fatal("nested parent activated children outside its outer queue")
 		}
 		f.wantNoLaunch()
 	})
@@ -219,8 +236,14 @@ func TestWorkflowRejectsInvalidPlansAndRechecksAfterWake(t *testing.T) {
 		if err := f.d.runStage(ctx, "TestOwner/testrepo", routes[authorColumn], card{ID: "parent"}, authorColumn); !errors.Is(err, errWorkflowBlocked) {
 			t.Fatalf("detached parent allowed: %v", err)
 		}
+		f.mergeTask("parent", "main")
+		f.kaneo.tasks["parent"]["status"] = strandedColumn
+		puts := f.kaneo.puts
+		_, err = f.d.reconcileCard(ctx, strandedColumn, card{ID: "parent"}, false, board{})
+		if !errors.Is(err, errWorkflowBlocked) || f.kaneo.puts != puts {
+			t.Fatalf("detached parent completed via leaf path: %v", err)
+		}
 		f.wantNoLaunch()
-
 	})
 	t.Run("dry run", func(t *testing.T) {
 		f := workflowFixture(t)
@@ -242,7 +265,7 @@ func TestWorkflowStoreRejectsCompetingSelections(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	state := &workflow{Order: []string{"a", "b"}}
+	state := &workflow{Phase: readyChild, Order: []string{"a", "b"}}
 	if err := saveWorkflow(ctx, maps, cm, "parent", state); err != nil {
 		t.Fatal(err)
 	}
@@ -275,7 +298,7 @@ func TestConcurrentActivationIssuesOnlyOneKaneoPut(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := saveWorkflow(ctx, f.d.workflows, cm, "parent", &workflow{Order: []string{"a", "b", "c"}}); err != nil {
+	if err := saveWorkflow(ctx, f.d.workflows, cm, "parent", &workflow{Phase: readyChild, Order: []string{"a", "b", "c"}}); err != nil {
 		t.Fatal(err)
 	}
 	entered, release := make(chan struct{}, 2), make(chan struct{})
@@ -328,5 +351,73 @@ func TestConcurrentActivationIssuesOnlyOneKaneoPut(t *testing.T) {
 	}
 	if f.kaneo.puts != 1 || f.kaneo.tasks["a"]["status"] != "in-progress" {
 		t.Fatal("activation overwrote newer worker state")
+	}
+}
+
+func TestWorkflowOrdersDependenciesThroughExternalTasks(t *testing.T) {
+	f := workflowFixture(t)
+	f.kaneo.relations = append(f.kaneo.relations, taskRelation{"b", "external", "blocks"}, taskRelation{"external", "a", "blocks"})
+	_, err := f.d.workflowParent(t.Context(), "parent", []string{"a", "b", "c"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.kaneo.tasks["b"]["status"] != "to-do" || f.kaneo.tasks["a"]["status"] != "backlog" || f.kaneo.tasks["external"]["status"] != "backlog" {
+		t.Fatal("indirect prerequisite did not run first, or external task was activated")
+	}
+}
+
+func TestMalformedLabelsCannotBypassManualGate(t *testing.T) {
+	f := workflowFixture(t)
+	reads := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/label/task/") {
+			reads++
+			w.Header().Set("Content-Type", "application/json")
+			if reads == 1 {
+				_, _ = w.Write([]byte(`[{"name":"repo:testrepo"},{"name":"workflow:manual"}]`))
+			} else {
+				_, _ = w.Write([]byte(`null`))
+			}
+			return
+		}
+		f.kaneo.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	f.d.kaneoURL = srv.URL
+	f.signed("/", move("standalone", authorColumn))
+	f.wantNoLaunch()
+	f.wantLog("not an array")
+}
+
+func TestUncertainWorkflowMoveRequiresObservedRecovery(t *testing.T) {
+	f := workflowFixture(t)
+	attempts := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut && r.URL.Path == "/api/task/a" {
+			attempts++
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		f.kaneo.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	f.d.kaneoURL = srv.URL
+	_, err := f.d.workflowParent(t.Context(), "parent", []string{"a", "b", "c"}, false)
+	if err == nil || attempts != 1 {
+		t.Fatalf("activation did not fail after claiming its move: attempts=%d err=%v", attempts, err)
+	}
+	_, err = f.d.workflowParent(t.Context(), "parent", []string{"a", "b", "c"}, false)
+	if !errors.Is(err, errWorkflowBlocked) || attempts != 1 {
+		t.Fatalf("uncertain PUT was replayed: attempts=%d err=%v", attempts, err)
+	}
+	f.kaneo.tasks["a"]["status"] = "to-do" // explicit operator recovery, observed by the next sweep
+	_, err = f.d.workflowParent(t.Context(), "parent", []string{"a", "b", "c"}, false)
+	if err != nil || attempts != 1 {
+		t.Fatalf("manual recovery failed: %v", err)
+	}
+	f.mergeTask("a", "main")
+	_, err = f.d.workflowParent(t.Context(), "parent", []string{"a", "b", "c"}, false)
+	if err != nil || f.kaneo.tasks["b"]["status"] != "to-do" {
+		t.Fatalf("queue did not advance after recovered child merged: %v", err)
 	}
 }

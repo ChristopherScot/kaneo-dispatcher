@@ -24,13 +24,45 @@ const manualLabel = "workflow:manual"
 // ConfigMap CAS before calling Kaneo, whose PUT API has no conditional update.
 // A crash or timeout after that claim must be observed or recovered manually;
 // replaying an uncertain PUT could overwrite a worker's newer status.
+type workflowPhase string
+
+const (
+	readyChild       workflowPhase = "ready-child"
+	awaitingChild    workflowPhase = "awaiting-child"
+	childrenComplete workflowPhase = "children-complete"
+)
+
 type workflow struct {
-	Order        []string  `json:"order"`
-	Index        int       `json:"index"`
-	ParentVisit  string    `json:"parentVisit,omitempty"`
-	BacklogSince time.Time `json:"backlogSince"`
-	Activated    bool      `json:"activated"`
-	Finished     bool      `json:"finished"`
+	Order        []string      `json:"order"`
+	Index        int           `json:"index"`
+	Phase        workflowPhase `json:"phase"`
+	BacklogSince time.Time     `json:"backlogSince"`
+	Pending      *workflowMove `json:"pending,omitempty"`
+}
+
+type workflowMove struct {
+	Task  string    `json:"task"`
+	From  string    `json:"from"`
+	To    string    `json:"to"`
+	Visit time.Time `json:"visit"`
+}
+
+// Observations are live facts, not persisted states. In particular, a claimed
+// move can still be waiting for an API response or need manual recovery.
+type workflowObservation struct {
+	ParentID, ParentStatus     string
+	ParentVisit                time.Time
+	ChildStatus                string
+	ChildVisit, NextChildVisit time.Time
+	ChildDone                  bool
+	PendingStatus              string
+	PendingVisit               time.Time
+}
+
+type workflowDecision struct {
+	State   workflow
+	Changed bool
+	Move    *workflowMove
 }
 
 type taskRelation struct {
@@ -90,6 +122,9 @@ func (d *dispatcher) manualTask(ctx context.Context, id string) (bool, error) {
 	if err := d.kaneo(ctx, "/label/task/"+url.PathEscape(id), &labels); err != nil {
 		return false, err
 	}
+	if labels == nil {
+		return false, fmt.Errorf("task labels for %s are not an array", id)
+	}
 	for _, label := range labels {
 		if label.Name == manualLabel {
 			return true, nil
@@ -129,43 +164,58 @@ func (d *dispatcher) completedWork(ctx context.Context, id string) (bool, error)
 	return pr.Base.Ref == repository.DefaultBranch && strings.EqualFold(pr.Base.Repo.FullName, repo), nil
 }
 
-// Walk all prerequisites, including external ones, to reject cycles and wait
-// for their merges. External prerequisites are never activated by this queue.
-func (d *dispatcher) dependenciesReady(ctx context.Context, id string) error {
+// prerequisites returns the full dependency closure, ordered before their
+// dependents. Both scheduling and launch gates use this walk, including paths
+// through external tasks; neither can overlook an indirect sibling dependency.
+func (d *dispatcher) prerequisites(ctx context.Context, id string) ([]string, error) {
 	visiting, visited := map[string]bool{}, map[string]bool{}
+	var dependencies []string
 	var visit func(string) error
-	visit = func(id string) error {
-		if visiting[id] {
-			return blocked("dependency cycle at %s", id)
+	visit = func(task string) error {
+		if visiting[task] {
+			return blocked("dependency cycle at %s", task)
 		}
-		if visited[id] {
+		if visited[task] {
 			return nil
 		}
-		visiting[id] = true
-		rels, err := d.relations(ctx, id)
+		visiting[task] = true
+		rels, err := d.relations(ctx, task)
 		if err != nil {
 			return err
 		}
 		for _, r := range rels {
-			if r.Type != "blocks" || r.Target != id {
-				continue
-			}
-			if err := visit(r.Source); err != nil {
-				return err
-			}
-			done, err := d.completedWork(ctx, r.Source)
-			if err != nil {
-				return err
-			}
-			if !done {
-				return blocked("waiting for %s to be Done with a merged PR", r.Source)
+			if r.Type == "blocks" && r.Target == task {
+				if err := visit(r.Source); err != nil {
+					return err
+				}
 			}
 		}
-		visiting[id] = false
-		visited[id] = true
+		visiting[task] = false
+		visited[task] = true
+		if task != id {
+			dependencies = append(dependencies, task)
+		}
 		return nil
 	}
-	return visit(id)
+	err := visit(id)
+	return dependencies, err
+}
+
+func (d *dispatcher) dependenciesReady(ctx context.Context, id string) error {
+	dependencies, err := d.prerequisites(ctx, id)
+	if err != nil {
+		return err
+	}
+	for _, dependency := range dependencies {
+		done, err := d.completedWork(ctx, dependency)
+		if err != nil {
+			return err
+		}
+		if !done {
+			return blocked("waiting for %s to be Done with a merged PR", dependency)
+		}
+	}
+	return nil
 }
 
 // Child order is a stable topological ordering; ticket number breaks ties.
@@ -187,8 +237,14 @@ func (d *dispatcher) workflowOrder(ctx context.Context, parent string, children 
 			if r.Type == "subtask" && (r.Source == id || r.Target == id && r.Source != parent) {
 				return nil, blocked("nested or shared subtask %s", id)
 			}
-			if r.Type == "blocks" && r.Target == id && slices.Contains(children, r.Source) {
-				dependencies[id] = append(dependencies[id], r.Source)
+		}
+		prerequisites, err := d.prerequisites(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		for _, dependency := range prerequisites {
+			if slices.Contains(children, dependency) {
+				dependencies[id] = append(dependencies[id], dependency)
 			}
 		}
 	}
@@ -228,6 +284,8 @@ func loadWorkflow(ctx context.Context, maps typedcorev1.ConfigMapInterface, pare
 	if maps == nil {
 		return nil, nil, fmt.Errorf("workflow store not configured")
 	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	cm, err := maps.Get(ctx, workflowMap, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
 		return &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: workflowMap}, Data: map[string]string{}}, nil, nil
@@ -246,6 +304,18 @@ func loadWorkflow(ctx context.Context, maps typedcorev1.ConfigMapInterface, pare
 	if len(state.Order) == 0 || state.Index < 0 || state.Index > len(state.Order) {
 		return nil, nil, fmt.Errorf("invalid workflow state for %s", parent)
 	}
+	switch state.Phase {
+	case readyChild, awaitingChild:
+		if state.Index == len(state.Order) {
+			return nil, nil, fmt.Errorf("workflow %s has no selected child in phase %s", parent, state.Phase)
+		}
+	case childrenComplete:
+		if state.Index != len(state.Order) {
+			return nil, nil, fmt.Errorf("workflow %s has unfinished children in completed phase", parent)
+		}
+	default:
+		return nil, nil, fmt.Errorf("workflow %s has unknown phase %q", parent, state.Phase)
+	}
 	return cm, &state, nil
 }
 
@@ -260,6 +330,8 @@ func saveWorkflow(ctx context.Context, maps typedcorev1.ConfigMapInterface, cm *
 		cm.Data = map[string]string{}
 	}
 	cm.Data[parent] = string(raw)
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	var saved *corev1.ConfigMap
 	if cm.ResourceVersion == "" {
 		saved, err = maps.Create(ctx, cm, metav1.CreateOptions{})
@@ -272,162 +344,260 @@ func saveWorkflow(ctx context.Context, maps typedcorev1.ConfigMapInterface, cm *
 	return err
 }
 
-// workflowParent handles a parent without ever sending it to an author pod.
-// Each board mutation is claimed durably before it is attempted.
-func (d *dispatcher) workflowParent(ctx context.Context, id string, children []string, dry bool) (cardResult, error) {
-	result := cardResult{skipped, id + ": sequential workflow"}
-	parent, err := d.workflowTask(ctx, id)
+// parentChildren recognizes saved parents even after all their relations are
+// removed. They must fail plan validation, never fall through to leaf handling.
+func (d *dispatcher) parentChildren(ctx context.Context, id string) ([]string, bool, error) {
+	rels, err := d.relations(ctx, id)
 	if err != nil {
-		return result, err
+		return nil, false, err
 	}
-	if parent.Status != authorColumn && parent.Status != strandedColumn {
-		return result, blocked("parent %s is paused in %s", id, parent.Status)
+	children := relationChildren(rels, id)
+	owner, err := d.workflowMembership(ctx, id)
+	return children, len(children) > 0 || owner == id, err
+}
+
+// A parent can be paused without changing queue state. Validate its identity
+// and manual gate here so orchestration and direct-child launches agree.
+func (d *dispatcher) workflowParentTask(ctx context.Context, id string) (workflowTask, error) {
+	task, err := d.workflowTask(ctx, id)
+	if err != nil {
+		return task, err
+	}
+	rels, err := d.relations(ctx, id)
+	if err != nil {
+		return task, err
+	}
+	for _, relation := range rels {
+		if relation.Type == "subtask" && relation.Target == id {
+			return task, blocked("nested parent %s", id)
+		}
+	}
+	owner, err := d.workflowMembership(ctx, id)
+	if err != nil {
+		return task, err
+	}
+	if owner != "" && owner != id {
+		return task, blocked("parent %s belongs to saved workflow %s", id, owner)
 	}
 	manual, err := d.manualTask(ctx, id)
 	if err != nil {
-		return result, err
+		return task, err
 	}
 	if manual {
-		return result, blocked("parent %s is manual", id)
+		return task, blocked("parent %s is manual", id)
 	}
-	if err := d.dependenciesReady(ctx, id); err != nil {
-		return result, err
-	}
-	order, err := d.workflowOrder(ctx, id, children)
-	if err != nil {
-		return result, err
-	}
-	cm, state, err := loadWorkflow(ctx, d.workflows, id)
-	if err != nil {
-		return result, err
-	}
-	changed := state == nil
-	if state == nil {
-		state = &workflow{Order: order}
-	}
+	return task, nil
+}
+
+func (d *dispatcher) checkWorkflowPlan(ctx context.Context, state *workflow, order []string) error {
 	if !slices.Equal(state.Order, order) {
-		return result, blocked("parent %s subtask plan changed; restore its relations before resuming", id)
+		return blocked("subtask plan changed; restore its relations before resuming")
 	}
-	// Completed children are checked again: reopening an earlier child pauses
-	// the queue, it cannot silently permit another child to continue.
-	for i, child := range state.Order {
-		task, err := d.workflowTask(ctx, child)
-		if err != nil {
-			return result, err
+	for i, sibling := range state.Order {
+		if i == state.Index {
+			continue
 		}
 		if i < state.Index {
-			done, err := d.completedWork(ctx, child)
+			done, err := d.completedWork(ctx, sibling)
 			if err != nil {
-				return result, err
+				return err
 			}
 			if !done {
-				return result, blocked("previous child %s is no longer complete", child)
+				return blocked("previous child %s is not Done and merged", sibling)
+			}
+		} else {
+			task, err := d.workflowTask(ctx, sibling)
+			if err != nil {
+				return err
+			}
+			if task.Status != "backlog" {
+				return blocked("later child %s must stay in Backlog", sibling)
 			}
 		}
-		if i > state.Index && task.Status != "backlog" {
-			return result, blocked("later child %s must stay in Backlog", child)
-		}
 	}
-	if state.Index < len(order) {
-		done, err := d.completedWork(ctx, order[state.Index])
+	return nil
+}
+
+// nextWorkflow is the queue's transition table. It proposes a new durable
+// state; only a caller that saves it with CAS may execute its new Move.
+// An intent loaded from storage is never permission to repeat a PUT.
+func nextWorkflow(state workflow, seen workflowObservation) (workflowDecision, error) {
+	if state.Pending != nil {
+		if seen.PendingStatus == state.Pending.From && seen.PendingVisit.Equal(state.Pending.Visit) {
+			return workflowDecision{}, blocked("move of %s to %s was already attempted; verify its outcome and recover explicitly", state.Pending.Task, state.Pending.To)
+		}
+		state.Pending = nil // the move or a later column visit was observed
+		return workflowDecision{State: state, Changed: true}, nil
+	}
+	claim := func(task, from, to string, visit time.Time) workflowDecision {
+		move := &workflowMove{Task: task, From: from, To: to, Visit: visit}
+		state.Pending = move
+		return workflowDecision{State: state, Changed: true, Move: move}
+	}
+	if seen.ParentStatus == authorColumn {
+		return claim(seen.ParentID, authorColumn, strandedColumn, seen.ParentVisit), nil
+	}
+	// Done means both the board status and qualifying merge were observed.
+	if seen.ChildDone && state.Phase != childrenComplete {
+		state.Index++
+		state.BacklogSince = seen.NextChildVisit
+		state.Phase = readyChild
+		if state.Index == len(state.Order) {
+			state.Phase = childrenComplete
+		}
+		return workflowDecision{State: state, Changed: true}, nil
+	}
+	switch state.Phase {
+	case readyChild:
+		if seen.ChildStatus != "backlog" {
+			state.Phase = awaitingChild // an explicit child start is also durable
+			return workflowDecision{State: state, Changed: true}, nil
+		}
+		if !seen.ChildVisit.Equal(state.BacklogSince) {
+			return workflowDecision{}, blocked("child %s changed columns; retry it explicitly", state.Order[state.Index])
+		}
+		state.Phase = awaitingChild
+		return claim(state.Order[state.Index], "backlog", authorColumn, seen.ChildVisit), nil
+	case awaitingChild:
+		if seen.ChildStatus == "backlog" {
+			return workflowDecision{}, blocked("child %s returned to Backlog; retry it explicitly", state.Order[state.Index])
+		}
+		return workflowDecision{}, nil
+	case childrenComplete:
+		return claim(seen.ParentID, strandedColumn, "done", seen.ParentVisit), nil
+	default:
+		return workflowDecision{}, fmt.Errorf("unknown workflow phase %q", state.Phase)
+	}
+}
+
+// workflowParent runs state-only transitions until it holds or performs the
+// child activation/final completion. Every iteration rereads durable state;
+// retries and overlapping replicas use exactly the same transition table.
+func (d *dispatcher) workflowParent(ctx context.Context, id string, children []string, dry bool) (cardResult, error) {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	result := cardResult{skipped, id + ": sequential workflow"}
+	children = slices.Clone(children)
+	slices.Sort(children)
+	for {
+		parent, err := d.workflowParentTask(ctx, id)
 		if err != nil {
 			return result, err
 		}
-		if done {
-			state.Index++
-			state.Activated = false
-			changed = true
+		if parent.Status != authorColumn && parent.Status != strandedColumn {
+			return result, blocked("parent %s is paused in %s", id, parent.Status)
 		}
-	}
-	if changed && state.Index < len(order) {
-		work, err := d.taskWork(ctx, order[state.Index], routes[authorColumn])
+		if err := d.dependenciesReady(ctx, id); err != nil {
+			return result, err
+		}
+		// Relations may have changed since the webhook or preceding transition.
+		rels, err := d.relations(ctx, id)
 		if err != nil {
 			return result, err
 		}
-		state.BacklogSince = work.enteredAt
-	}
-	if parent.Status == authorColumn {
+		if !slices.Equal(relationChildren(rels, id), children) {
+			return result, blocked("parent %s relations changed", id)
+		}
+		order, err := d.workflowOrder(ctx, id, children)
+		if err != nil {
+			return result, err
+		}
+		cm, state, err := loadWorkflow(ctx, d.workflows, id)
+		if err != nil {
+			return result, err
+		}
+		newPlan := state == nil
+		if newPlan {
+			state = &workflow{Order: order, Phase: readyChild}
+		}
+		if err := d.checkWorkflowPlan(ctx, state, order); err != nil {
+			return result, err
+		}
+		seen := workflowObservation{ParentID: id, ParentStatus: parent.Status}
 		work, err := d.taskWork(ctx, id, routes[authorColumn])
 		if err != nil {
 			return result, err
 		}
-		visit := work.enteredAt.String()
-		if state.ParentVisit == visit {
-			return result, blocked("parent activation was already attempted; move %s to In Progress to recover", id)
+		seen.ParentVisit = work.enteredAt
+		if state.Index < len(order) {
+			child := order[state.Index]
+			task, err := d.workflowTask(ctx, child)
+			if err != nil {
+				return result, err
+			}
+			seen.ChildStatus = task.Status
+			work, err := d.taskWork(ctx, child, routes[authorColumn])
+			if err != nil {
+				return result, err
+			}
+			seen.ChildVisit = work.enteredAt
+			if newPlan {
+				state.BacklogSince = work.enteredAt
+			}
+			seen.ChildDone, err = d.completedWork(ctx, child)
+			if err != nil {
+				return result, err
+			}
+			if seen.ChildDone && state.Index+1 < len(order) {
+				work, err := d.taskWork(ctx, order[state.Index+1], routes[authorColumn])
+				if err != nil {
+					return result, err
+				}
+				seen.NextChildVisit = work.enteredAt
+			}
 		}
-		state.ParentVisit = visit
-		changed = true
-	}
-	if state.Index == len(order) {
-		if state.Finished {
-			return result, blocked("completion was already attempted; verify and move %s to Done manually", id)
+		if state.Pending != nil {
+			if state.Pending.Task == id {
+				seen.PendingStatus, seen.PendingVisit = seen.ParentStatus, seen.ParentVisit
+			} else if state.Index < len(order) && state.Pending.Task == order[state.Index] {
+				seen.PendingStatus, seen.PendingVisit = seen.ChildStatus, seen.ChildVisit
+			} else {
+				return result, fmt.Errorf("workflow intent names a task other than its parent or current child")
+			}
 		}
-		state.Finished = true
-		changed = true
-	}
-	if dry {
-		return cardResult{skipped, id + ": sequential workflow [dry-run]"}, nil
-	}
-	if changed {
-		if err := saveWorkflow(ctx, d.workflows, cm, id, state); err != nil {
+		decision, err := nextWorkflow(*state, seen)
+		if err != nil {
 			return result, err
 		}
-	}
-	if parent.Status == authorColumn {
-		ok, err := d.moveTask(ctx, id, authorColumn, strandedColumn, false)
+		if !decision.Changed {
+			return result, nil
+		}
+		if decision.Move != nil && decision.Move.Task != id {
+			manual, err := d.manualTask(ctx, decision.Move.Task)
+			if err != nil {
+				return result, err
+			}
+			if manual {
+				return result, blocked("%s requires manual work/approval (%s)", decision.Move.Task, manualLabel)
+			}
+			if err := d.dependenciesReady(ctx, decision.Move.Task); err != nil {
+				return result, err
+			}
+		}
+		if dry {
+			return cardResult{skipped, id + ": sequential workflow [dry-run]"}, nil
+		}
+		if err := saveWorkflow(ctx, d.workflows, cm, id, &decision.State); err != nil {
+			return result, err
+		}
+		if decision.Move == nil {
+			continue
+		}
+		move := decision.Move
+		ok, err := d.moveTask(ctx, move.Task, move.From, move.To, false)
 		if err != nil {
 			return result, err
 		}
 		if !ok {
 			return result, errCardChanged
 		}
-	}
-	if state.Index == len(order) {
-		ok, err := d.moveTask(ctx, id, strandedColumn, "done", false)
-		if err != nil {
-			return result, err
+		if move.To == "done" {
+			return cardResult{completed, id + ": all subtasks Done and merged"}, nil
 		}
-		if !ok {
-			return result, errCardChanged
+		if move.Task != id {
+			return cardResult{redispatched, id + ": activated " + move.Task}, nil
 		}
-		return cardResult{completed, id + ": all subtasks Done and merged"}, nil
 	}
-	child := order[state.Index]
-	if err := d.workflowGate(ctx, child); err != nil {
-		return result, err
-	}
-	task, err := d.workflowTask(ctx, child)
-	if err != nil {
-		return result, err
-	}
-	if task.Status != "backlog" {
-		return result, nil
-	}
-	// A manually moved child may have run and failed before a parent sweep
-	// observed it. Preserve its new Backlog visit even without our own claim.
-	work, err := d.taskWork(ctx, child, routes[authorColumn])
-	if err != nil {
-		return result, err
-	}
-	if !work.enteredAt.Equal(state.BacklogSince) {
-		return result, blocked("child %s changed columns; retry it explicitly", child)
-	}
-	if state.Activated {
-		return result, blocked("child %s activation was already attempted or it returned to Backlog; retry it explicitly", child)
-	}
-	state.Activated = true
-	if err := saveWorkflow(ctx, d.workflows, cm, id, state); err != nil {
-		return result, err
-	}
-	ok, err := d.moveTask(ctx, child, "backlog", authorColumn, false)
-	if err != nil {
-		return result, err
-	}
-	if !ok {
-		return result, errCardChanged
-	}
-	// The normal webhook launches it. The minute sweep recovers a missed one.
-	return cardResult{redispatched, id + ": activated " + child}, nil
 }
 
 // workflowGate is used both before waking and immediately before launching.
@@ -475,7 +645,7 @@ func (d *dispatcher) workflowGate(ctx context.Context, id string) error {
 	if parent == "" {
 		return nil
 	}
-	task, err := d.workflowTask(ctx, parent)
+	task, err := d.workflowParentTask(ctx, parent)
 	if err != nil {
 		return err
 	}
@@ -497,30 +667,8 @@ func (d *dispatcher) workflowGate(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
-	if !slices.Equal(state.Order, order) {
-		return blocked("parent %s subtask plan changed", parent)
-	}
-	for i, sibling := range state.Order {
-		if i == state.Index {
-			continue
-		}
-		if i < state.Index {
-			done, err := d.completedWork(ctx, sibling)
-			if err != nil {
-				return err
-			}
-			if !done {
-				return blocked("previous child %s is not Done and merged", sibling)
-			}
-		} else {
-			task, err := d.workflowTask(ctx, sibling)
-			if err != nil {
-				return err
-			}
-			if task.Status != "backlog" {
-				return blocked("later child %s is outside Backlog", sibling)
-			}
-		}
+	if err := d.checkWorkflowPlan(ctx, state, order); err != nil {
+		return err
 	}
 	return d.dependenciesReady(ctx, parent)
 }

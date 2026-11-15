@@ -97,6 +97,22 @@ The dispatcher does not infer approval from ticket prose or worker comments.
 Existing hand-run worker scripts bypass the dispatcher; do not use their
 unfiltered sweep mode for these workflows.
 
+The parent queue is an explicit finite state machine in plain Go:
+
+| Phase | Meaning | Next transition |
+| --- | --- | --- |
+| `ready-child` | The selected child has not been activated by the queue. | Claim its activation after dependency and manual gates pass. |
+| `awaiting-child` | Activation was claimed or an explicit start was observed. | Wait for Done plus a qualifying merge, then select the next child. |
+| `children-complete` | Every child met the completion gate. | Claim the parent's move to Done. |
+
+A separate pending move records the task, source/target columns, and observed
+column visit. `nextWorkflow` is a pure decision function; its executor saves the
+proposed state with CAS before performing a newly claimed move. A loaded pending
+move is observed and acknowledged, never replayed. Pauses, manual flags, and
+unmet dependencies are live guards rather than additional stored states. Parent
+identity and eligibility checks are shared with direct-child dispatch. Ordering
+includes dependency paths through external tickets without activating them.
+
 The runtime ConfigMap `claude-pods/kaneo-workflows` stores one JSON value per
 parent. It is created by the service, has no secrets, and is deliberately not
 an Argo-managed manifest. Kubernetes resource versions protect competing

@@ -268,12 +268,12 @@ func (d *dispatcher) detach(r *http.Request, work func(ctx context.Context)) {
 // dispatch runs the stage a column implies for one card, or logs one line
 // saying why not.
 func (d *dispatcher) dispatch(ctx context.Context, column string, st stage, c card) {
-	rels, err := d.relations(ctx, c.ID)
+	children, isParent, err := d.parentChildren(ctx, c.ID)
 	if err != nil {
 		slog.Error("read workflow", "task", c.ID, "err", err)
 		return
 	}
-	if children := relationChildren(rels, c.ID); len(children) > 0 {
+	if isParent {
 		result, err := d.workflowParent(ctx, c.ID, children, false)
 		slog.Info("workflow", "task", c.ID, "result", result.detail, "err", err)
 		return

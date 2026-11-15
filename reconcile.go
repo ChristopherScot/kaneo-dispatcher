@@ -109,11 +109,11 @@ func (d *dispatcher) reconcile(ctx context.Context, dryRun bool) (sweep, error) 
 // read as "nothing to do", because a card nobody can see is the failure
 // this sweep exists for.
 func (d *dispatcher) reconcileCard(ctx context.Context, column string, c card, dryRun bool, b board) (cardResult, error) {
-	rels, err := d.relations(ctx, c.ID)
+	children, isParent, err := d.parentChildren(ctx, c.ID)
 	if err != nil {
 		return cardResult{}, err
 	}
-	if children := relationChildren(rels, c.ID); len(children) > 0 {
+	if isParent {
 		return d.workflowParent(ctx, c.ID, children, dryRun)
 	}
 	manual, err := d.manualTask(ctx, c.ID)
