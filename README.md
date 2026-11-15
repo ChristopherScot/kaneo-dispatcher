@@ -43,12 +43,24 @@ same-repository PR, re-reads the card before updating, and verifies the result.
 Backlog and Done remain untouched. Kaneo has no conditional update operation;
 a concurrent edit between the final read and PUT can still be overwritten.
 
-Unfinished work in dispatching columns is retried after `RECONCILE_STALE`
-(4h). Stale In Progress cards return to the author, whose mode logic decides
-how to resume. Existing PRs or integration statuses do not suppress retries:
+Workers post `Work started: stage-author`, `stage-test`, or `stage-merge`
+comments on the card once they hold their pod lock and reach actual task work.
+The reconciler uses Kaneo's server timestamp for this durable start signal:
+
+- Without a start signal for the current stage and column visit, retry after
+  `RECONCILE_UNCLAIMED` (15m) from the last column move or task creation.
+- With a start signal, allow `RECONCILE_STALE` (4h) from the latest start.
+- A later column move invalidates the previous signal, even if the card
+  returns to the same stage. Ordinary comments do not extend either window.
+
+The CronJob sweeps every minute, so an unclaimed card is normally eligible
+within 15–16 minutes. Busy pods remain protected by their lock. Slow sweeps
+are serialized, and pending launches recheck the start signal after waking.
+Stale In Progress cards return to the author, whose mode logic decides how
+to resume. Existing PRs or integration statuses do not suppress retries:
 the stage owns recovery of unfinished work. Unmerged human-review cards remain parked. Busy workers are
 reported as skipped, and failed launches as errors. `POST /reconcile?dry`
-performs reads only. The hourly `kaneo-reconcile` CronJob remains the caller.
+performs reads only. The `kaneo-reconcile` CronJob remains the caller.
 
 ## Layout
 
@@ -103,8 +115,8 @@ This PR transfers the existing Deployment, Service and Ingress from the
 `claude-pods` Argo Application to `kaneo-dispatcher`. A normal automated sync
 could prune them before the replacement image or Vault role is ready.
 
-1. Deploy the companion homelab worker change (`NIGHTLY_LAUNCH_ACK` support
-   in `pod-common.sh`) before switching the dispatcher. Confirm every session
+1. Deploy the companion homelab worker change (launch acknowledgment and durable
+   work-start comments) before switching the dispatcher. Confirm every session
    pod uses that worker image; older workers cannot acknowledge launches.
    Publish the service image from this branch using the workflow's manual
    trigger. It publishes a SHA tag; verify that image before selecting it for

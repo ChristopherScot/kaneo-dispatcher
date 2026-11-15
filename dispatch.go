@@ -89,7 +89,9 @@ type dispatcher struct {
 	secret       []byte // the HMAC key Kaneo signs deliveries with
 	ghToken      string
 	repos        map[string][]string // pod ordinal -> the owner/name repos it works
-	stale        time.Duration       // how long a card may sit before the sweep asks why
+	stale        time.Duration       // grace period after a worker starts
+	unclaimed    time.Duration       // retry delay when no worker has started
+	sweepMu      sync.Mutex          // prevent overlapping asynchronous sweeps
 	exec         execer
 	wake         waker
 	client       *http.Client
@@ -122,13 +124,13 @@ func fromEnv() (*dispatcher, error) {
 	if len(missing) > 0 {
 		return nil, fmt.Errorf("%s not set; see config.yaml", strings.Join(missing, ", "))
 	}
-	stale := 4 * time.Hour
-	if s := os.Getenv("RECONCILE_STALE"); s != "" {
-		var err error
-		stale, err = time.ParseDuration(s)
-		if err != nil {
-			return nil, fmt.Errorf("RECONCILE_STALE: %w", err)
-		}
+	stale, err := time.ParseDuration(envOr("RECONCILE_STALE", "4h"))
+	if err != nil || stale <= 0 {
+		return nil, fmt.Errorf("RECONCILE_STALE must be a positive duration")
+	}
+	unclaimed, err := time.ParseDuration(envOr("RECONCILE_UNCLAIMED", "15m"))
+	if err != nil || unclaimed <= 0 {
+		return nil, fmt.Errorf("RECONCILE_UNCLAIMED must be a positive duration")
 	}
 	exec, wake, err := newPodClient(envOr("DISPATCH_NS", "claude-pods"))
 	if err != nil {
@@ -147,12 +149,13 @@ func fromEnv() (*dispatcher, error) {
 		secret:       []byte(secret),
 		// GITHUB_TOKEN is deliberately not required: only the sweep uses
 		// it, and the webhook path must not depend on it. See github().
-		ghToken: os.Getenv("GITHUB_TOKEN"),
-		repos:   reposFromEnv(os.Environ()),
-		stale:   stale,
-		exec:    exec,
-		wake:    wake,
-		client:  &http.Client{Timeout: 30 * time.Second},
+		ghToken:   os.Getenv("GITHUB_TOKEN"),
+		repos:     reposFromEnv(os.Environ()),
+		stale:     stale,
+		unclaimed: unclaimed,
+		exec:      exec,
+		wake:      wake,
+		client:    &http.Client{Timeout: 30 * time.Second},
 	}, nil
 }
 
@@ -271,7 +274,7 @@ func (d *dispatcher) dispatch(ctx context.Context, column string, st stage, c ca
 		return
 	}
 	if err := d.runStage(ctx, repo, st, c, column); err != nil {
-		if errors.Is(err, errPodBusy) || errors.Is(err, errCardChanged) {
+		if errors.Is(err, errPodBusy) || errors.Is(err, errCardChanged) || errors.Is(err, errWorkStarted) {
 			slog.Warn("skip", "task", c.name(), "column", column, "repo", repo, "reason", err)
 			return
 		}
@@ -303,6 +306,7 @@ func (d *dispatcher) repoFor(ctx context.Context, id string, st stage) (repo, sk
 var (
 	errPodBusy     = errors.New("pod busy")
 	errCardChanged = errors.New("card changed before launch")
+	errWorkStarted = errors.New("worker already started this stage")
 )
 
 // runStage wakes the pods, rechecks the card and waits for worker acceptance.
@@ -325,6 +329,15 @@ func (d *dispatcher) runStage(ctx context.Context, repo string, st stage, c card
 	}
 	if current.ID != c.ID || current.ProjectID != d.project || current.Status != column {
 		return errCardChanged
+	}
+	// A queued wake or duplicate delivery may arrive after another worker
+	// started. Re-read the durable signal before trying to launch again.
+	work, err := d.taskWork(ctx, c.ID, st)
+	if err != nil {
+		return err
+	}
+	if !work.startedAt.IsZero() && time.Since(work.startedAt) < d.stale {
+		return errWorkStarted
 	}
 	pod := st.pod()
 	busy, err := d.podIsBusy(ctx, pod)

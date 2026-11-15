@@ -278,6 +278,7 @@ func newFixture(t *testing.T) *fixture {
 		ghToken:      "ghtoken",
 		repos:        map[string][]string{"0": {"TestOwner/testrepo", "TestOwner/other"}, "2": {"TestOwner/testrepo"}},
 		stale:        4 * time.Hour,
+		unclaimed:    15 * time.Minute,
 		exec:         f.pods.exec,
 		wake:         f.pods.wake,
 		client:       &http.Client{Timeout: 5 * time.Second},

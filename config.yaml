@@ -26,6 +26,8 @@ image:
 
 env:
     DISPATCH_NS: claude-pods
+    RECONCILE_STALE: 4h
+    RECONCILE_UNCLAIMED: 15m
     # In-cluster Service, not the ingress: cluster DNS does not resolve
     # *.home.chrisscotmartin.com. The webhook payload carries no labels,
     # so the repo: label is read back from this API.

@@ -51,25 +51,44 @@ func openPR(sha string) []map[string]any {
 	return []map[string]any{{"merged_at": nil, "number": 1, "head": map[string]any{"sha": sha, "ref": "fix/t1", "repo": map[string]string{"full_name": "TestOwner/testrepo"}}}}
 }
 
-func TestFreshCardIsLeftAlone(t *testing.T) {
-	f := newFixture(t)
-	f.kaneo.board = boardWith("to-do", "t1", "T-1", ago(10*time.Hour))
-	f.moved("t1", 1*time.Hour)
-	f.kaneo.labels["t1"] = []string{"repo:testrepo"}
-	s := f.reconcile(false)
-	if s.checked != 1 || len(s.redispatched)+len(s.skipped)+len(s.errors) != 0 {
-		t.Errorf("sweep = %+v, want one card checked and nothing said", s)
+func TestReconcileUsesWorkerStartForRetryDelay(t *testing.T) {
+	for _, tc := range []struct {
+		name, column, startedStage string
+		movedAgo, startedAgo       time.Duration
+		wantLaunch                 bool
+	}{
+		{"unclaimed grace", "to-do", "", time.Minute, 0, false},
+		{"unclaimed retry", "to-do", "", 16 * time.Minute, 0, true},
+		{"worker started", "in-review", "stage-test", 6 * time.Hour, time.Hour, false},
+		{"started attempt expired", "in-review", "stage-test", 6 * time.Hour, 5 * time.Hour, true},
+		{"old attempt cannot delay new move", "to-do", "stage-author", 16 * time.Minute, time.Hour, true},
+		{"other stage cannot claim work", "in-review", "stage-author", 16 * time.Minute, time.Minute, true},
+		{"author started after moving", "in-progress", "stage-author", time.Hour, 59 * time.Minute, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			f.stale(tc.column)
+			f.moved("t1", tc.movedAgo)
+			if tc.startedStage != "" {
+				f.kaneo.activity["t1"] = append(f.kaneo.activity["t1"], map[string]string{
+					"type": "comment", "content": "Work started: " + tc.startedStage, "createdAt": ago(tc.startedAgo),
+				})
+			}
+			s := f.reconcile(false)
+			if len(s.errors) != 0 {
+				t.Fatalf("sweep errors: %v", s.errors)
+			}
+			if got := len(f.pods.launches()) > 0; got != tc.wantLaunch {
+				t.Fatalf("launched=%v, want %v; sweep=%+v", got, tc.wantLaunch, s)
+			}
+		})
 	}
-	if hits := f.github.calls(); len(hits) != 1 {
-		t.Errorf("fresh card must be checked for merge: %v", hits)
-	}
-	f.wantNoLaunch()
 }
 
 func TestInertColumnsAreNotSwept(t *testing.T) {
 	f := newFixture(t)
 	f.kaneo.board = boardWith("to-do", "t1", "T-1", ago(10*time.Hour))
-	f.moved("t1", 1*time.Hour)
+	f.moved("t1", time.Minute)
 	f.kaneo.labels["t1"] = []string{"repo:testrepo"}
 	// boardWith also plants a 99h-old card in needs-human-review.
 	if s := f.reconcile(false); s.checked != 1 {
@@ -79,14 +98,11 @@ func TestInertColumnsAreNotSwept(t *testing.T) {
 
 // The author moves a card to In Progress first and works second, so an
 // author that dies in between strands it where nothing dispatches from.
-// A stale card there goes back to the author - with its work-exists
-// check skipped, because judging existing work is the author's job and
-// it must see the card to do it. CLA-15, 2026-11-10.
+// A stale card there goes back to the author, which owns resume policy.
 func TestStrandedInProgressCardIsHandedBackToTheAuthor(t *testing.T) {
 	f := newFixture(t)
 	f.stale("in-progress")
-	// Work exists: an open pull request. For any dispatching column that
-	// would mean "skip"; here it is precisely what the author must judge.
+	// The existing PR is for the author to resume.
 	f.github.prs["TestOwner:fix/t1"] = openPR("abc")
 	s := f.reconcile(false)
 	if len(s.redispatched) != 1 || s.redispatched[0] != "T-1 (in-progress, 5h)" {
@@ -100,18 +116,6 @@ func TestStrandedInProgressCardIsHandedBackToTheAuthor(t *testing.T) {
 	if hits := f.github.calls(); len(hits) != 1 {
 		t.Errorf("expected merge lookup only: %v", hits)
 	}
-}
-
-func TestFreshInProgressCardIsLeftAlone(t *testing.T) {
-	f := newFixture(t)
-	f.kaneo.board = boardWith("in-progress", "t1", "T-1", ago(10*time.Hour))
-	f.moved("t1", 1*time.Hour)
-	f.kaneo.labels["t1"] = []string{"repo:testrepo"}
-	s := f.reconcile(false)
-	if s.checked != 1 || len(s.redispatched)+len(s.skipped)+len(s.errors) != 0 {
-		t.Errorf("sweep = %+v, want the card checked and left alone: the author may still be working it", s)
-	}
-	f.wantUntouched()
 }
 
 func TestStaleToDoWithExistingPRResumesAuthor(t *testing.T) {

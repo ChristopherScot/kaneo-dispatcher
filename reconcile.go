@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"path"
 	"strings"
 	"time"
 )
@@ -139,10 +140,11 @@ func (d *dispatcher) reconcileCard(ctx context.Context, column string, c card, d
 		return cardResult{}, nil
 	}
 
-	since, err := d.enteredColumnAt(ctx, c.ID)
+	work, err := d.taskWork(ctx, c.ID, st)
 	if err != nil {
 		return cardResult{}, err
 	}
+	since := work.enteredAt
 	if since.IsZero() {
 		// No recorded move means the card was created straight into this
 		// column and never moved, so no webhook ever fired for it. Treat
@@ -155,9 +157,14 @@ func (d *dispatcher) reconcileCard(ctx context.Context, column string, c card, d
 			return cardResult{}, fmt.Errorf("createdAt %q: %w", c.CreatedAt, err)
 		}
 	}
+	delay := d.unclaimed
+	if !work.startedAt.IsZero() {
+		since = work.startedAt
+		delay = d.stale
+	}
 	age := time.Since(since)
-	if age < d.stale {
-		return cardResult{}, nil // a worker may still be running
+	if age < delay {
+		return cardResult{}, nil
 	}
 	// The stage owns resume/rework policy. A PR or integration status may
 	// exist even though its corresponding board transition never happened.
@@ -173,7 +180,7 @@ func (d *dispatcher) reconcileCard(ctx context.Context, column string, c card, d
 	// summary line is what a morning reads, and "redispatched 1" over a
 	// card that never started is worse than silence.
 	if err := d.runStage(ctx, repo, st, c, column); err != nil {
-		if errors.Is(err, errPodBusy) || errors.Is(err, errCardChanged) {
+		if errors.Is(err, errPodBusy) || errors.Is(err, errCardChanged) || errors.Is(err, errWorkStarted) {
 			return cardResult{skipped, c.name() + ": " + err.Error()}, nil
 		}
 		return cardResult{}, err
@@ -181,31 +188,49 @@ func (d *dispatcher) reconcileCard(ctx context.Context, column string, c card, d
 	return cardResult{redispatched, line}, nil
 }
 
-// enteredColumnAt is when the card last changed column, or zero when it
-// never has. The task object's updatedAt is null in this Kaneo build, so
-// the activity feed is the only record of it.
-func (d *dispatcher) enteredColumnAt(ctx context.Context, id string) (time.Time, error) {
+// Workers post this exact marker after acquiring their lock and reaching the
+// task's work. Kaneo's activity timestamps survive dispatcher/pod restarts.
+const workStartedPrefix = "Work started: "
+
+type workState struct {
+	enteredAt time.Time
+	startedAt time.Time
+}
+
+func (d *dispatcher) taskWork(ctx context.Context, id string, st stage) (workState, error) {
 	var acts []struct {
 		Type      string `json:"type"`
 		CreatedAt string `json:"createdAt"`
+		Content   string `json:"content"`
 	}
+	var work workState
 	if err := d.kaneo(ctx, "/activity/"+url.PathEscape(id), &acts); err != nil {
-		return time.Time{}, err
+		return work, err
 	}
-	var latest time.Time
+	marker := workStartedPrefix + path.Base(st.script)
 	for _, a := range acts {
-		if a.Type != "status_changed" {
+		moved := a.Type == "status_changed"
+		started := a.Type == "comment" && a.Content == marker
+		if !moved && !started {
 			continue
 		}
-		t, err := time.Parse(time.RFC3339Nano, a.CreatedAt)
+		at, err := time.Parse(time.RFC3339Nano, a.CreatedAt)
 		if err != nil {
-			return time.Time{}, fmt.Errorf("activity of %s: createdAt %q: %w", id, a.CreatedAt, err)
+			return workState{}, fmt.Errorf("activity of %s: createdAt %q: %w", id, a.CreatedAt, err)
 		}
-		if t.After(latest) {
-			latest = t
+		if moved && at.After(work.enteredAt) {
+			work.enteredAt = at
+		}
+		if started && at.After(work.startedAt) {
+			work.startedAt = at
 		}
 	}
-	return latest, nil
+	// A later column move starts a new attempt, even when it returns to the
+	// same stage. A prior attempt must never delay picking up the new one.
+	if work.startedAt.Before(work.enteredAt) {
+		work.startedAt = time.Time{}
+	}
+	return work, nil
 }
 
 // github reads the REST API with the configured token.
@@ -216,6 +241,13 @@ func (d *dispatcher) github(ctx context.Context, p string, out any) error {
 // runSweep is reconcile plus its log lines, for the handler that runs it
 // after answering.
 func (d *dispatcher) runSweep(ctx context.Context, dryRun bool) {
+	// The HTTP trigger returns 202 before finishing; CronJob Forbid alone
+	// cannot prevent the next minute's request from overlapping a slow wake.
+	if !d.sweepMu.TryLock() {
+		slog.Info("reconcile already running")
+		return
+	}
+	defer d.sweepMu.Unlock()
 	s, err := d.reconcile(ctx, dryRun)
 	if err != nil {
 		slog.Error("reconcile failed", "err", err)

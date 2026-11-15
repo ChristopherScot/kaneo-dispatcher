@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestUnsignedPostIsRefused(t *testing.T) {
@@ -363,15 +364,23 @@ func TestNonzeroLaunchIsAnError(t *testing.T) {
 	}
 }
 
-func TestCardMovedDuringWakeDoesNotLaunch(t *testing.T) {
-	f := newFixture(t)
-	f.kaneo.labels["t1"] = []string{"repo:testrepo"}
-	f.d.wake = func(context.Context) error {
-		f.kaneo.mu.Lock()
-		defer f.kaneo.mu.Unlock()
-		f.kaneo.tasks["t1"]["status"] = "backlog"
-		return nil
+func TestWorkChangedDuringWakeDoesNotLaunch(t *testing.T) {
+	for _, change := range []string{"moved", "started"} {
+		t.Run(change, func(t *testing.T) {
+			f := newFixture(t)
+			f.kaneo.labels["t1"] = []string{"repo:testrepo"}
+			f.d.wake = func(context.Context) error {
+				f.kaneo.mu.Lock()
+				defer f.kaneo.mu.Unlock()
+				if change == "moved" {
+					f.kaneo.tasks["t1"]["status"] = "backlog"
+				} else {
+					f.kaneo.activity["t1"] = []map[string]string{{"type": "comment", "content": "Work started: stage-author", "createdAt": ago(time.Minute)}}
+				}
+				return nil
+			}
+			f.signed("/", move("t1", "to-do"))
+			f.wantNoLaunch()
+		})
 	}
-	f.signed("/", move("t1", "to-do"))
-	f.wantNoLaunch()
 }
