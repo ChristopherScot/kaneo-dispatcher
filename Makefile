@@ -5,7 +5,7 @@
 SHELL := /bin/bash
 .DEFAULT_GOAL := help
 
-PORT ?= 3000
+PORT ?= 8080
 export PORT
 
 .PHONY: help
@@ -25,7 +25,7 @@ endif
 # -o and the package are load-bearing.
 .PHONY: build
 build:
-	go build -o kaneo-dispatcher .
+	CGO_ENABLED=0 go build -o bin/app .
 
 # -race matches CI.
 .PHONY: test

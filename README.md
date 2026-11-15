@@ -1,139 +1,120 @@
 # kaneo-dispatcher
 
+Turns a card move on the Kaneo board into a run in a Claude session pod.
 Owned by me-myself-and-i.
 
-## Usage
+Kaneo posts a `task.status_changed` webhook here whenever a card changes
+column. Three columns start work - see `routes` in `dispatch.go`, which
+is the one place that table lives - and every other column is logged as
+a `noop`, which is the audit trail of every card movement. That table is
+the safety property: a pod moving a card to `in-progress` cannot
+re-trigger the author, because `in-progress` triggers nothing. Keep it in
+step with the column graph written down in
+`claude-pods/lib/pod-common.sh`.
 
-TODO — what this API is for, and who calls it.
+## What a delivery goes through
 
-## The spec is the source of truth
+1. The body is capped at 1 MiB (413 over) and the `X-Kaneo-Signature`
+   HMAC-SHA256 over the raw bytes is checked in constant time (401 on a
+   mismatch). Nothing runs for an unsigned request.
+2. 202 is answered before any work, so Kaneo's delivery health does not
+   wait on a pod.
+3. The card's `repo:<name>` label is read back from the Kaneo API - the
+   payload carries no labels - resolved to `owner/name`, and checked
+   against the list of repos the target pod works (`REPOS_POD<n>`).
+4. The `claude-session` StatefulSet is woken: scaled to one past the
+   highest ordinal `routes` names and waited on until every pod is
+   ready, bounded at ten minutes. The `session-sleep` CronJob in
+   `claude-pods/` is the matching sleep. A wake that fails is logged for
+   the card and nothing is exec'd; the sweep below is the retry.
+5. The pod's lock file is probed with `flock -n`, the same file the
+   scripts lock. A pod that is already running a stage is left alone and
+   the card stays where it is: moving it again later is the retry.
+6. The stage is launched detached (`setsid nohup ... &`) through the
+   Kubernetes exec API, so it outlives this process, a rollout and any
+   network blip. It is handed the task id and the repo, since
+   `stage-author` refuses a named task without one.
 
-`openapi.yml` describes this API. Everything else is generated from it:
+`POST /reconcile`, behind the same signature, checks active and human-review
+cards for a merged PR and moves them to Done. It uses the newest matching
+same-repository PR, re-reads the card before updating, and verifies the result.
+Backlog and Done remain untouched. Kaneo has no conditional update operation;
+a concurrent edit between the final read and PUT can still be overwritten.
 
-| path | what | regenerate with |
-|---|---|---|
-| `api/oas_*.go` | server interface, types, validation, Go client | `homelabctl regen` |
-| `clients/ts/schema.d.ts` | TypeScript types | `homelabctl regen` |
-
-**Change the API in `openapi.yml`, never in Go.** Add a path, run
-`homelabctl regen`, and the build will fail until you write the handler:
-
-```
-service does not implement api.Handler (missing method GetThing)
-```
-
-That is the point — the code cannot drift from the spec, because it will
-not compile if it does. CI runs `homelabctl regen` and fails on a diff, so
-a spec change cannot merge without the code that matches it.
+Unfinished work in dispatching columns is retried after `RECONCILE_STALE`
+(4h). Stale In Progress cards return to the author, whose mode logic decides
+how to resume. Unmerged human-review cards remain parked. Busy workers are
+reported as skipped, and failed launches as errors. `POST /reconcile?dry`
+performs reads only. The hourly `kaneo-reconcile` CronJob remains the caller.
 
 ## Layout
 
 ```
-openapi.yml          the API contract
-main.go              process lifecycle: logging, timeouts, shutdown
-server.go            handlers, metrics middleware, route mounting
-api/                 generated, plus two files that are not:
-  client.go            timeouts, retries, circuit breaking
-  paging.go            cursor iteration as a range loop
-clients/ts/          the TypeScript client
-deploy/              Kubernetes manifests, rendered from config.yaml
-config.yaml          what this service is, for homelabctl
+main.go        process lifecycle: logging, timeouts, shutdown
+server.go      routes, metrics middleware, the bounded signed read
+dispatch.go    the column table, label lookup, wake, busy probe, launch
+reconcile.go   the sweep, and the GitHub questions it asks
+kube.go        exec and the StatefulSet wake through the API server,
+               with the pod's own identity
+rbac.yaml      the Role that allows both; listed in config.yaml
+config.yaml    what this service is, for homelabctl
+deploy/        Kubernetes manifests, rendered from config.yaml
 ```
 
-`server.go` is the seam: a service whose shape the spec cannot express - a
-reverse proxy, say - replaces that one file with a hand-written
-`handler()`, and everything else stays as generated. Its header lists what
-a replacement has to keep.
-
-`api/client.go` and `api/paging.go` are hand-written and live in `api/` on
-purpose: a consumer imports that package, and getting the protocol client
-without the defaults would be worse than useless.
-
-## Build
+Everything the service reads comes from the environment, and every
+secret in it is a key under `secrets:` in `config.yaml`, read from Vault.
+The Vault role that allows those reads is derived from the same file:
 
 ```sh
-make build                       # compile
-make run                         # PORT=3000 by default
-wgo run .                        # the same, restarted on every save
-homelabctl regen                 # after editing openapi.yml
+homelabctl vault          # print the policy and role
+homelabctl vault --apply  # write them
 ```
 
-## Testing
+## Build and test
 
 ```sh
-make test                        # go vet and go test -race. What CI runs.
+make test                 # go vet, go test -race. What CI runs.
+make build
 ```
 
-Add a service's own setup — a database, a seed step, extra env — to
-`Makefile.local`. It is not generated, so it survives a regenerate.
-
-```sh
-homelabctl check deploy          # deploy manifests and spec problems
-homelabctl diff                  # what would change in the GitOps repo
-```
-
-`wgo` is `go run` with a file watcher, and needs installing once:
-
-```sh
-go install github.com/bokwoon95/wgo@latest
-```
-
-Chosen over air, the more popular option, because it needs no config
-file, creates no `tmp/` directory to gitignore, and prints your
-program's output rather than its own banner. `wgo run .` behaves exactly
-like `go run .`, which is the whole feature.
-
-Bump `info.version` in `openapi.yml` when the API changes, then
-`homelabctl regen` — it syncs the version the clients report. CI releases
-both clients on a version change: it tags the repo, which IS the Go
-client's version, and publishes the TypeScript client to npm.
-
-```sh
-go get github.com/ChristopherScot/kaneo-dispatcher@v0.2.0
-npm install @christopherscot/kaneo-dispatcher-client@0.2.0
-```
-
-Go needs no registry — a tag on this repo is a module version. npm has no
-equivalent: `npm install github:owner/repo` reads `package.json` from the
-repository root, which is not where a service in a monorepo lives, so the
-client is published instead.
-
-Publishing uses npm trusted publishing (OIDC), so there is no token in
-this repo's secrets. It needs a one-time setup per package, once:
-
-```sh
-npm trust github @christopherscot/kaneo-dispatcher-client \
-  --file publish.yaml --repo ChristopherScot/kaneo-dispatcher --allow-publish
-```
-
-Note the casing: npm rejects an uppercase scope, and the repository must
-match GitHub's spelling exactly, because npm compares it against the
-OIDC claim literally. A mismatch fails with a 404 naming the package,
-which points nowhere near the owner.
-
-Until that exists the publish step fails, which is deliberate: a Go tag
-whose TypeScript counterpart silently never shipped is worse than a red
-build.
-
-## Calling this service
-
-```go
-c, err := api.NewClient(url, api.WithClient(api.NewHTTPClient(api.HTTPOptions{})))
-```
-
-The zero value is the intended default: a 5s timeout, one retry, no
-breaker. One retry rather than five, because five can mean five times the
-traffic to a dependency that is already struggling. Pass
-`api.ExponentialRetry{}` or `api.NoRetry{}`, and a `Breaker`, when a
-specific call wants something else.
+The tests need no cluster, no Kaneo and no GitHub: `testhelp_test.go`
+fakes all three and records what the dispatcher asked a pod to run.
 
 ## Deploy
 
-Push to main. CI builds the image; argocd-image-updater sees the new digest
-and commits it to the homelab repo; ArgoCD syncs it. No homelab credential
-lives in this repo.
+Follow the first-deployment handoff below before merging. Subsequently, CI builds the image; argocd-image-updater sees the new
+digest and the `kaneo-dispatcher` Application syncs it. The Service
+answers on 80 (what the generated Ingress routes to) and on 8080, which
+is the port Kaneo's webhook integration and the reconcile CronJob post
+to: `http://kaneo-dispatcher.claude-pods.svc.cluster.local:8080`.
 
 `deploy/` is rendered from `config.yaml`. Adjust it with `patches` there,
-keyed by resource kind, rather than editing the manifests — a patch merges
-into what the tool generates, so later convention changes still reach this
-service.
+keyed by resource kind, rather than editing the manifests. `homelabctl register` publishes `deploy/kaneo-dispatcher/argocd.json` into the homelab repository.
+
+### First deployment handoff
+
+This PR transfers the existing Deployment, Service and Ingress from the
+`claude-pods` Argo Application to `kaneo-dispatcher`. A normal automated sync
+could prune them before the replacement image or Vault role is ready.
+
+1. Publish the service image from this branch using the workflow's manual
+   trigger. It publishes a SHA tag; verify that image before selecting it for
+   the first rollout. The default branch publishes `latest` after merging.
+2. From this directory, run `homelabctl vault --apply` with an authenticated
+   Vault administrator. This creates the new role for ServiceAccount
+   `kaneo-dispatcher`; retain the existing `claude-pods` policy and role.
+3. Pause automated sync on `claude-pods` and the root app while transferring
+   ownership. Record their existing sync settings first. Merge, then sync the
+   new Application with the verified image digest. Confirm the ExternalSecret
+   is Ready, the Deployment is Available and both Service ports work.
+4. Confirm Argo tracking on Deployment, Service and Ingress now names
+   `kaneo-dispatcher` before allowing the old Application to prune. Restore
+   the recorded sync settings and confirm both Applications are healthy.
+5. Verify a signed dry reconcile and a controlled dispatch through client-go
+   against the real kubelet. Keep the card open until these checks pass.
+
+If the new deployment fails, stop its automatic sync before restoring the
+previous Deployment/Service/Ingress from the pre-merge revision. Preserve the
+Kaneo webhook URL and existing secrets throughout the handoff.
+
+Scaffold provenance: generated with `homelabctl init kaneo-dispatcher --runtime go-service --no-spec`; untouched output is commit `521e1db`. Placeholder route/client-floor tests were replaced with webhook and reconciliation tests. Set `HOMELAB_CHECKOUT` when running tests to verify worker lock and sleep contracts across repositories.

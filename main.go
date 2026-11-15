@@ -38,7 +38,7 @@ func main() {
 		"version", version,
 	))
 
-	h, err := handler()
+	h, drain, err := handler()
 	if err != nil {
 		slog.Error("building handler", "err", err)
 		os.Exit(1)
@@ -46,7 +46,7 @@ func main() {
 
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "3000"
+		port = "8080"
 	}
 	// govulncheck flags the missing ReadHeaderTimeout specifically; the
 	// rest bound the Slowloris shape.
@@ -71,6 +71,18 @@ func main() {
 		defer cancel()
 		if err := srv.Shutdown(ctx); err != nil {
 			slog.Error("shutdown", "err", err)
+		}
+		// Shutdown waits for handlers, which answer in microseconds; the
+		// work they accepted is still running. A lookup, probe or launch
+		// is bounded in seconds and fits inside the grace period. A cold
+		// wake is bounded in minutes and does not: it is abandoned here,
+		// deliberately, and the sweep finds the card.
+		drained := make(chan struct{})
+		go func() { drain(); close(drained) }()
+		select {
+		case <-drained:
+		case <-ctx.Done():
+			slog.Warn("shutdown: in-flight dispatch abandoned; the sweep will find it")
 		}
 		close(idle)
 	}()

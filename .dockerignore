@@ -2,3 +2,5 @@
 .github
 deploy
 *.md
+
+.homelab

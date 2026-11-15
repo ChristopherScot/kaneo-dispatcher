@@ -1,7 +1,7 @@
 {
   "name": "kaneo-dispatcher",
   "team": "me-myself-and-i",
-  "namespace": "kaneo-dispatcher",
+  "namespace": "claude-pods",
   "image": "ghcr.io/christopherscot/kaneo-dispatcher",
   "repoURL": "https://github.com/ChristopherScot/kaneo-dispatcher",
   "manifestPath": "deploy/kaneo-dispatcher"

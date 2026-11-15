@@ -50,7 +50,13 @@ jobs:
       # runs "what CI runs", and that is only true if this IS it. Two
       # copies of the same command drift, and the one that drifts is
       # whichever nobody is looking at.
+      - uses: actions/checkout@v4
+        with:
+          repository: ChristopherScot/homelab
+          path: .homelab
       - name: Test
+        env:
+          HOMELAB_CHECKOUT: ${{ github.workspace }}/.homelab
         run: make test
 
       # CGO_ENABLED=0: a cgo binary links against glibc and will not run on
