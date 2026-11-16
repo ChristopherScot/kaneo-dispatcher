@@ -434,3 +434,61 @@ func TestUncertainWorkflowMoveRequiresObservedRecovery(t *testing.T) {
 		t.Fatalf("queue did not advance after recovered child merged: %v", err)
 	}
 }
+
+// A real eight-child chain exhausted Kaneo's 100-request window before the
+// first child could be queued. Keep the budget on the complete activation,
+// including the fresh validation after moving the parent.
+func TestWorkflowActivationRequestBudget(t *testing.T) {
+	f := workflowFixture(t)
+	f.kaneo.relations = nil
+	var children []string
+	for i := range 8 {
+		id := fmt.Sprintf("child-%d", i)
+		children = append(children, id)
+		f.kaneo.tasks[id] = map[string]any{"id": id, "projectId": "proj", "status": "backlog", "number": i + 1}
+		f.kaneo.labels[id] = []string{"repo:testrepo"}
+		f.kaneo.relations = append(f.kaneo.relations, taskRelation{"parent", id, "subtask"})
+		if i > 0 {
+			f.kaneo.relations = append(f.kaneo.relations, taskRelation{children[i-1], id, "blocks"})
+		}
+	}
+	_, err := f.d.workflowParent(t.Context(), "parent", children, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.kaneo.tasks[children[0]]["status"] != "to-do" || f.kaneo.tasks[children[1]]["status"] != "backlog" {
+		t.Fatal("did not activate only the first child")
+	}
+	if f.kaneo.hits >= 100 {
+		t.Fatalf("activation used %d Kaneo requests; exhausts the real 100-request window", f.kaneo.hits)
+	}
+	t.Logf("eight-child activation: %d Kaneo requests", f.kaneo.hits)
+}
+
+func TestWorkflowRefreshesAfterRateLimitWait(t *testing.T) {
+	f := workflowFixture(t)
+	limited := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !limited && r.URL.Path == "/api/task-relation/a" && f.kaneo.tasks["parent"]["status"] == "in-progress" {
+			limited = true
+			// A human pauses the parent while dependency validation is waiting.
+			f.kaneo.tasks["parent"]["status"] = "backlog"
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		f.kaneo.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	f.d.kaneoURL = srv.URL
+	_, err := f.d.workflowParent(t.Context(), "parent", []string{"a", "b", "c"}, false)
+	if !limited || !errors.Is(err, errWorkflowBlocked) || f.kaneo.tasks["a"]["status"] != "backlog" || f.kaneo.puts != 1 {
+		t.Fatalf("stale validation activated child: limited=%v puts=%d err=%v", limited, f.kaneo.puts, err)
+	}
+	// Resuming must recover the observed parent move without a stranded claim.
+	f.kaneo.tasks["parent"]["status"] = "in-progress"
+	_, err = f.d.workflowParent(t.Context(), "parent", []string{"a", "b", "c"}, false)
+	if err != nil || f.kaneo.tasks["a"]["status"] != "to-do" || f.kaneo.puts != 2 {
+		t.Fatalf("resume stranded or replayed the move: puts=%d err=%v", f.kaneo.puts, err)
+	}
+}

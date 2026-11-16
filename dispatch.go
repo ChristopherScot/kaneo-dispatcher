@@ -94,6 +94,7 @@ type dispatcher struct {
 	stale        time.Duration       // grace period after a worker starts
 	unclaimed    time.Duration       // retry delay when no worker has started
 	workflows    typedcorev1.ConfigMapInterface
+	kaneoLimit   kaneoCooldown
 	sweepMu      sync.Mutex // prevent overlapping asynchronous sweeps
 	exec         execer
 	wake         waker
@@ -473,7 +474,7 @@ func (d *dispatcher) repoForTask(ctx context.Context, id string) (repo string, o
 
 // kaneo GETs a path under /api and decodes the JSON it returns.
 func (d *dispatcher) kaneo(ctx context.Context, p string, out any) error {
-	return getJSON(ctx, d.client, d.kaneoURL+"/api"+p, d.apiKey, out)
+	return d.kaneoRequest(ctx, http.MethodGet, p, nil, out)
 }
 
 // getJSON reads a JSON response; callers validate endpoint-specific fields.
