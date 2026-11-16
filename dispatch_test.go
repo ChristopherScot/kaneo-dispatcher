@@ -141,7 +141,7 @@ func TestFailedWakeIsLoggedAndNothingIsExecd(t *testing.T) {
 	if calls := f.pods.all(); len(calls) != 0 {
 		t.Errorf("exec'd into a set that did not wake: %v", calls)
 	}
-	f.wantLog(`msg="dispatch failed" task=t2 column=to-do repo=TestOwner/testrepo err="wake: claude-session not ready after 10m0s of waking (1 of 3 ready)"`)
+	f.wantLog(`card="t2: wake: claude-session not ready after 10m0s of waking (1 of 3 ready)"`)
 }
 
 // Stages are pinned to pods by ordinal, so the wake must cover the
@@ -210,7 +210,7 @@ func TestBusyPodIsNotGivenASecondRun(t *testing.T) {
 	f.kaneo.labels["t2"] = []string{"repo:testrepo"}
 	f.signed("/", move("t2", "to-do"))
 	f.wantNoLaunch()
-	f.wantLog(`reason="pod busy"`)
+	f.wantLog(`card="t2: pod busy"`)
 }
 
 // A failed probe must not read as idle: starting a second agent on a
@@ -221,7 +221,7 @@ func TestUnansweredBusyProbeReportsAnError(t *testing.T) {
 	f.kaneo.labels["t2"] = []string{"repo:testrepo"}
 	f.signed("/", move("t2", "to-do"))
 	f.wantNoLaunch()
-	f.wantLog("dispatch failed")
+	f.wantLog("reconcile error")
 	f.wantLog("probe claude-session-0")
 
 }
@@ -232,7 +232,7 @@ func TestPodThatDoesNotWorkTheRepoIsSkipped(t *testing.T) {
 	f.signed("/", move("t2", "to-do"))
 	// A skipped card must not wake the set either: a skip costs nothing.
 	f.wantUntouched()
-	f.wantLog(`reason="claude-session-0 does not work TestOwner/elsewhere"`)
+	f.wantLog(`card="t2: claude-session-0 does not work TestOwner/elsewhere"`)
 }
 
 // A short label resolves under the owner once, in repoForTask, so the
@@ -297,7 +297,7 @@ func TestCardWithoutExactlyOneRepoLabelIsSkipped(t *testing.T) {
 			f.kaneo.labels["t2"] = tc.labels
 			f.signed("/", move("t2", "to-do"))
 			f.wantNoLaunch()
-			f.wantLog(`reason="card needs exactly one repo: label"`)
+			f.wantLog(`card="t2: card needs exactly one repo: label"`)
 		})
 	}
 }
@@ -308,7 +308,7 @@ func TestLabelLookupFailureIsAnErrorNotNoLabel(t *testing.T) {
 	f.kaneo.labelErr = http.StatusBadGateway
 	f.signed("/", move("t2", "to-do"))
 	f.wantNoLaunch()
-	f.wantLog(`msg="cannot read labels" task=t2 column=to-do`)
+	f.wantLog(`msg="reconcile error" card="t2: GET /api/label/task/t2`)
 	f.wantLog("502")
 	if strings.Contains(f.log.String(), "exactly one repo") {
 		t.Error("a failed lookup was reported as a missing label")
@@ -321,6 +321,10 @@ func TestLabelLookupFailureIsAnErrorNotNoLabel(t *testing.T) {
 func TestNonArrayLabelAnswerIsAnError(t *testing.T) {
 	f := newFixture(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/task/tasks/") {
+			_, _ = io.WriteString(w, `{"data":{"columns":[{"slug":"to-do","tasks":[{"id":"t2"}]}]}}`)
+			return
+		}
 		if strings.HasPrefix(r.URL.Path, "/api/task-relation/") {
 			_, _ = io.WriteString(w, `[]`)
 			return
@@ -331,7 +335,7 @@ func TestNonArrayLabelAnswerIsAnError(t *testing.T) {
 	f.d.kaneoURL = srv.URL
 	f.signed("/", move("t2", "to-do"))
 	f.wantNoLaunch()
-	f.wantLog(`msg="cannot read labels"`)
+	f.wantLog(`msg="reconcile error"`)
 }
 
 func TestPayloadWithoutATaskIdIsSkipped(t *testing.T) {

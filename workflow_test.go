@@ -163,7 +163,7 @@ func TestSequentialWorkflowRecoveryAndMergeGates(t *testing.T) {
 	f.wantNoLaunch()
 	f.mergeTask("c", "main")
 	f.kaneo.tasks["c"]["status"] = "needs-human-review"
-	result, err := f.d.reconcileCard(ctx, "needs-human-review", card{ID: "c"}, false, board{})
+	result, err := f.d.reconcileCard(ctx, "needs-human-review", card{ID: "c"}, false, board{}, nil)
 	if err != nil || result.outcome != skipped || f.kaneo.tasks["c"]["status"] != "needs-human-review" {
 		t.Fatalf("manual completion bypassed: %#v %v", result, err)
 	}
@@ -244,7 +244,7 @@ func TestWorkflowRejectsInvalidPlansAndRechecksAfterWake(t *testing.T) {
 		f.mergeTask("parent", "main")
 		f.kaneo.tasks["parent"]["status"] = strandedColumn
 		puts := f.kaneo.puts
-		_, err = f.d.reconcileCard(ctx, strandedColumn, card{ID: "parent"}, false, board{})
+		_, err = f.d.reconcileCard(ctx, strandedColumn, card{ID: "parent"}, false, board{}, nil)
 		if !errors.Is(err, errWorkflowBlocked) || f.kaneo.puts != puts {
 			t.Fatalf("detached parent completed via leaf path: %v", err)
 		}

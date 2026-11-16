@@ -1,4 +1,5 @@
 digraph fsm {
+    "issued" -> "finished" [ label = "launch-rejected" ];
     "issued" -> "starting" [ label = "start" ];
     "reporting" -> "finished" [ label = "reported" ];
     "running" -> "reporting" [ label = "report" ];

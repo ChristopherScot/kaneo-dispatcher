@@ -59,6 +59,7 @@ func reportTo(t *testing.T, f *fixture, command *workerCommand, event string) in
 func TestCommandLifecycleAndStaleReports(t *testing.T) {
 	f := newFixture(t)
 	f.stale("to-do")
+	f.kaneo.board = nil
 	command := commandFor(t, f, "to-do")
 	if got := reportTo(t, f, command, "author-started"); got != 200 {
 		t.Fatalf("start: %d", got)
@@ -148,7 +149,9 @@ func TestCommandMetadataCASPreservesOtherCards(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := f.d.saveCommandRecord(t.Context(), other, "other", command); err != nil {
+	otherCommand := *command
+	otherCommand.Stage = "test"
+	if err := f.d.saveCommandRecord(t.Context(), other, "other", &otherCommand); err != nil {
 		t.Fatal(err)
 	}
 	command.Phase = "running"

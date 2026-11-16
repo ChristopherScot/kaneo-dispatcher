@@ -60,7 +60,7 @@ func TestReconcileUsesWorkerStartForRetryDelay(t *testing.T) {
 		movedAgo, startedAgo       time.Duration
 		wantLaunch                 bool
 	}{
-		{"unclaimed grace", "to-do", "", time.Minute, 0, false},
+		{"new queued card", "to-do", "", time.Minute, 0, true},
 		{"unclaimed retry", "to-do", "", 16 * time.Minute, 0, true},
 		{"worker started", "in-review", "stage-test", 6 * time.Hour, time.Hour, false},
 		{"started attempt expired", "in-review", "stage-test", 6 * time.Hour, 5 * time.Hour, true},
