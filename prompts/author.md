@@ -18,8 +18,8 @@ the card is what a human reads.
 
    If it genuinely should not be done, do NOT close or delete the card.
    Describe what you checked and what you found in your final report.
-   The dispatcher owns Kaneo updates.
-   then say "OBSOLETE: <reason>" and stop. A human moves it to Done or
+   The worker forwards that report through the dispatcher to the card.
+   Then say "OBSOLETE: <reason>" and stop. A human moves it to Done or
    drags it back; deciding that for them is how a live ticket disappears.
 
    If it is ambiguous — it may be obsolete but you cannot prove it either
@@ -70,10 +70,9 @@ the card is what a human reads.
 
    A run can stop for reasons that have nothing to do with the work: a
    usage limit, a timeout, a node going away. Commits that exist only in
-   this pod's clone die with it, and the clone is reset to origin at the
-   start of every ticket, so unpushed work is lost even if the pod
-   survives. A pushed branch costs nothing and means a stopped run
-   resumes from where it got to instead of starting over.
+   this pod's clone depend on its PVC surviving. The worker preserves
+   unpushed work by holding subsequent checkouts for recovery. Pushing
+   each commit lets a later command resume without that manual recovery.
 
      git push -u origin {{branch}}     # first commit
      git push                        # after each round
