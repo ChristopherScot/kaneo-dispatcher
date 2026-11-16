@@ -167,6 +167,11 @@ func TestEachColumnRoutesToItsOwnPod(t *testing.T) {
 			f := newFixture(t)
 			f.d.repos = nil // every pod works every repo here
 			f.kaneo.labels["t"] = []string{"repo:testrepo"}
+			if tc.column != "to-do" {
+				pr := openPR("abc")[0]
+				pr["head"].(map[string]any)["ref"] = "fix/t"
+				f.github.prs["TestOwner:fix/t"] = []map[string]any{pr}
+			}
 			f.signed("/", move("t", tc.column))
 			l := f.pods.launches()
 			if len(l) != 1 || l[0].pod != tc.pod || l[0].argv[3] != tc.script {

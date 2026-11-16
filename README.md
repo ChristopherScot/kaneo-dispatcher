@@ -46,10 +46,10 @@ a concurrent edit between the final read and PUT can still be overwritten.
 Workers execute only dispatcher-issued commands. They report to the synchronous
 `POST /worker-events` endpoint, authenticated with the mounted Kaneo API key and
 bound to a random command ID. A valid response is HTTP 200 with a matching v1
-acknowledgment; an old dispatcher's catch-all 202 is rejected. Workers retain
-read-only Kaneo context access, but all board changes, notes, mentions and PR
-links go through the dispatcher. They never scan the board or other repositories
-for work.
+acknowledgment; an old dispatcher's catch-all 202 is rejected. Workers receive
+ticket context with the command; all Kaneo reads and writes, including notes,
+mentions and PR links, go through the dispatcher. They never scan the board or
+other repositories for work.
 
 Commands persist in the runtime `kaneo-commands` ConfigMap. A started report
 moves the ticket through the lifecycle FSM and records the start timestamp only
@@ -74,6 +74,47 @@ to resume. Existing PRs or integration statuses do not suppress retries:
 the stage owns recovery of unfinished work. Unmerged human-review cards remain parked. Busy workers are
 reported as skipped, and failed launches as errors. `POST /reconcile?dry`
 performs reads only. The `kaneo-reconcile` CronJob remains the caller.
+
+## Dispatcher-owned prompts
+
+The dispatcher embeds the Markdown files in `prompts/` and freezes one selected
+template, ticket description/comments, repository revisions, execution timeout
+and result contract when issuing a command. Author commands explicitly select
+fresh work, rework, resume, advance-without-Claude or human review. GitHub lookup
+failures hold the task; only a confirmed missing branch means fresh work.
+
+`POST /worker-command` returns the persisted snapshot to the authenticated worker
+that names its task and command ID. Fetching is read-only and never rebuilds the
+snapshot from current templates or Kaneo. The payload is a JSON **string** whose
+exact UTF-8 bytes are hashed with SHA-256; neither side reserializes it to verify
+the digest. Template content has a separate digest. Protocol marker 2 prevents
+new commands from reaching workers that still choose local templates.
+
+The worker verifies identity, version, digest and result format, then renders only
+`{{workspace}}` and `{{verdict_file}}`. Ticket/comment text is appended as data;
+it is never substituted against environment variables. The worker archives the
+response, exact payload, final prompt and provenance hashes under
+`$STATE_DIR/commands/<command-id>/` before starting. Reusing that directory is
+refused. Tool permissions, credentials and Claude invocation remain worker-owned.
+The start report acknowledges the frozen digest, and the dispatcher revalidates
+the selected GitHub refs/PR before granting work. Workers also revalidate before
+checkout, preserve unpublished local changes, and refuse test/review verdicts
+if HEAD changed during execution.
+
+Prompt edits require a dispatcher build/rollout, not a worker image change, as
+long as the execution/result contract stays compatible. Already-issued commands
+keep their original snapshot, including ticket comments; subsequent edits take
+effect in newly issued commands. New protocol/result formats require a worker
+upgrade and are rejected by old renderers. Existing pre-upgrade commands may
+still report results during a quiesced migration.
+
+Snapshots are limited to 64 KiB, including context. Oversized tickets hold explicitly
+rather than silently dropping requirements. New snapshots are admitted below a
+768 KiB command-store budget; progress metadata can use reserved space up to
+1000 KiB, and shrinking writes remain permitted. Finished commands remove their
+heavy payload while retaining digests; uncertain commands keep it for recovery.
+The latest command record is retained per task; historical exact prompts live
+in the worker PVC archive, not an unbounded server-side history.
 
 ## Board and command state machines
 
@@ -280,8 +321,8 @@ keyed by resource kind, rather than editing the manifests. `homelabctl register`
 The companion homelab worker PR and this service must be deployed together, with
 existing stage runs quiesced first. Deploy the dispatcher endpoint and RBAC,
 then roll every session pod to the companion worker image. The new launcher
-checks the protocol marker before executing an old worker; new workers reject
-old launches without a command ID. There is no direct-Kaneo fallback.
+requires protocol marker 2 before executing a worker; new workers reject
+missing or unsupported prompt snapshots. There is no direct-Kaneo fallback.
 
 Verify the worker image on every pod (the StatefulSet partition may retain old
 images), the endpoint's strict v1 acknowledgment, signed dry reconciliation, and

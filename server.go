@@ -109,6 +109,7 @@ func (d *dispatcher) mux() http.Handler {
 	mux.HandleFunc("GET /reconcile", func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "POST with a signature", http.StatusMethodNotAllowed)
 	})
+	mux.HandleFunc("POST /worker-command", observe("worker-command", d.workerPrompt))
 	mux.HandleFunc("POST /worker-events", observe("worker-events", d.workerEvent))
 	mux.HandleFunc("POST /reconcile", observe("reconcile", d.reconcileHandler))
 

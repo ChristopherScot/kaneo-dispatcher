@@ -303,6 +303,7 @@ func (d *dispatcher) runSweep(ctx context.Context, dryRun bool) {
 // Only the newest PR from this repository and exact task branch can finish
 // a card. Paginate so an old merge cannot hide a newer use of the branch.
 type pullRequest struct {
+	State    string  `json:"state"`
 	Body     string  `json:"body"`
 	Number   int     `json:"number"`
 	MergedAt *string `json:"merged_at"`
