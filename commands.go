@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ChristopherScot/kaneo-dispatcher/internal/protocol"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -166,18 +167,7 @@ func (d *dispatcher) moveTicket(ctx context.Context, id, column, event string, e
 	return d.moveTask(ctx, id, column, target, false)
 }
 
-type workerReport struct {
-	PromptDigest string `json:"promptDigest,omitempty"`
-	Message      string `json:"message,omitempty"`
-	URL          string `json:"url,omitempty"`
-	Title        string `json:"title,omitempty"`
-	PR           int    `json:"pr,omitempty"`
-	SHA          string `json:"sha,omitempty"`
-	Task         string `json:"task"`
-	Command      string `json:"command"`
-	Event        string `json:"event"`
-	RevertPR     int    `json:"revertPR,omitempty"`
-}
+type workerReport = protocol.Report
 
 func (d *dispatcher) workerEvent(w http.ResponseWriter, r *http.Request) {
 	if !d.authorizedWorker(w, r) {
@@ -380,7 +370,14 @@ func (d *dispatcher) commandWork(ctx context.Context, id string, st stage, work 
 // Notes and links are command-scoped reports; workers never call Kaneo writes.
 func (d *dispatcher) workerArtifact(ctx context.Context, report workerReport) error {
 	p := "/comment/" + url.PathEscape(report.Task)
-	body := map[string]string{"content": report.Message}
+	if report.NoteKind != "" && (report.Event != "note" || report.NoteKind != "rework") {
+		return fmt.Errorf("unsupported note kind")
+	}
+	message := report.Message
+	if report.NoteKind == "rework" {
+		message = reworkHeadline + ": " + message
+	}
+	body := map[string]string{"content": message}
 	if report.Event == "link" {
 		if report.URL == "" || !strings.HasPrefix(report.URL, "https://github.com/") {
 			return fmt.Errorf("invalid PR URL")

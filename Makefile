@@ -14,7 +14,8 @@ export PORT
 help:
 	@echo "kaneo-dispatcher"
 	@echo
-	@echo "  make build      compile"
+	@echo "  make build      compile dispatcher"
+	@echo "  make worker     compile pod worker"
 	@echo "  make test       vet and tests (what CI runs)"
 	@echo "  make graph      generate the FSM Graphviz DOT and PNG"
 	@echo "  make run        run it on :$(PORT)"
@@ -69,3 +70,7 @@ clean:
 	rm -f $(BINARY)
 
 -include Makefile.local
+
+.PHONY: worker
+worker:
+	CGO_ENABLED=0 go build -o bin/kaneo-worker ./cmd/kaneo-worker

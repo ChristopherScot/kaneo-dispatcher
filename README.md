@@ -87,7 +87,7 @@ failures hold the task; only a confirmed missing branch means fresh work.
 that names its task and command ID. Fetching is read-only and never rebuilds the
 snapshot from current templates or Kaneo. The payload is a JSON **string** whose
 exact UTF-8 bytes are hashed with SHA-256; neither side reserializes it to verify
-the digest. Template content has a separate digest. Protocol marker 2 prevents
+the digest. Template content has a separate digest. Protocol marker 3 prevents
 new commands from reaching workers that still choose local templates.
 
 The worker verifies identity, version, digest and result format, then renders only
@@ -115,6 +115,52 @@ rather than silently dropping requirements. New snapshots are admitted below a
 heavy payload while retaining digests; uncertain commands keep it for recovery.
 The latest command record is retained per task; historical exact prompts live
 in the worker PVC archive, not an unbounded server-side history.
+
+## Go worker
+
+`cmd/kaneo-worker` runs one command in an existing session pod:
+
+```sh
+kaneo-worker <author|test|merge> <task-id> <owner/repository> <command-id>
+```
+
+`internal/protocol` defines the wire types shared by the dispatcher and worker.
+`internal/worker` owns admission, exact prompt archives, checkout protection,
+Claude execution, result parsing and reports. The three homelab stage scripts
+only exec this binary. Git, GitHub CLI and Claude remain subprocesses; the
+worker is not another service and does not own a second board FSM.
+
+The worker holds the existing pod lock and passes its descriptor to supervised
+tools, so a worker crash cannot mark a surviving tool idle. Normal completion
+and cancellation clean up each tool's process group. One Claude deadline covers
+model probing and account fallback; each attempt receives the same frozen
+prompt. Output and credential-redacted attempt records are bounded and archived.
+A nonzero exit or error result cannot produce a passing test/review verdict.
+Test verdict files live in the command archive, outside the repository.
+
+Merge authorization precedes a durable intent, then the exact-head GitHub merge
+request. The confirmed merge SHA is archived before any completion report.
+Post-merge verification queries that commit, and uncertain writes are never
+replayed. Inspect `merge-intent.json`, `merge-completed.json`, `revert-intent.json`
+and `revert-merge-completed.json` with GitHub before manually recovering a held
+command. Archive directories and records are synced before work depends on them.
+
+Workers send structured rework notes; the dispatcher formats the historical
+receipt that its retry counter recognizes. Workers no longer know the receipt
+headline. Unknown, incomplete or truncated CI observations hold the command.
+
+Build with `make worker`; the companion homelab Dockerfile builds this command
+from a reviewed source commit. Deploy the service before the matching worker
+image. Protocol marker 3 refuses older Bash workers, which cannot send the new
+structured reports. Quiesce existing runs first; inspect old repository-local
+`.nightly-verdict` scratch files and dirty checkouts before enabling commands.
+The Go worker preserves existing work and does not silently clean a checkout
+left by an older worker.
+
+Bash remains only for entrypoints and best-effort disk/cache housekeeping.
+The separate account helper still used by desloppify is unchanged. Go execution
+and failure-path tests live with the worker; image entrypoint and maintenance
+checks remain in homelab. No CI tool version is pinned by this migration.
 
 ## Board and command state machines
 
@@ -211,8 +257,8 @@ then mark it Done; its queue verifies the merge before advancing. This is a
 manual gate, not an approval token: removing the label enables automation and
 must be a deliberate operator decision. CLA-27 uses this gate for cutover.
 The dispatcher does not infer approval from ticket prose or worker comments.
-Existing hand-run worker scripts bypass the dispatcher; do not use their
-unfiltered sweep mode for these workflows.
+Stage entrypoints require a dispatcher-issued command ID and have no sweep
+mode. Manually executing a worker does not bypass dispatcher authorization.
 
 The parent queue uses [looplab/fsm](https://github.com/looplab/fsm) for its phase transitions:
 
@@ -321,7 +367,7 @@ keyed by resource kind, rather than editing the manifests. `homelabctl register`
 The companion homelab worker PR and this service must be deployed together, with
 existing stage runs quiesced first. Deploy the dispatcher endpoint and RBAC,
 then roll every session pod to the companion worker image. The new launcher
-requires protocol marker 2 before executing a worker; new workers reject
+requires protocol marker 3 before executing a worker; new workers reject
 missing or unsupported prompt snapshots. There is no direct-Kaneo fallback.
 
 Verify the worker image on every pod (the StatefulSet partition may retain old
@@ -331,4 +377,4 @@ a pause, a lost report, and an unclaimed retry. Preserve both runtime ConfigMaps
 across rollbacks; old dispatcher/worker versions do not understand command state.
 These changes have not been deployed or live-tested by this PR.
 
-Scaffold provenance: generated with `homelabctl init kaneo-dispatcher --runtime go-service --no-spec`; untouched output is commit `521e1db`. Placeholder route/client-floor tests were replaced with webhook and reconciliation tests. Set `HOMELAB_CHECKOUT` when running tests to verify worker lock and sleep contracts across repositories.
+Scaffold provenance: generated with `homelabctl init kaneo-dispatcher --runtime go-service --no-spec`; untouched output is commit `521e1db`. Placeholder route/client-floor tests were replaced with webhook and reconciliation tests. Set `HOMELAB_CHECKOUT` when running tests to verify the session-sleep contract across repositories.
