@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
+	"time"
 )
 
 // requestJSON owns authentication, status checking and bounded response reads.
@@ -38,7 +40,11 @@ func requestJSON(ctx context.Context, client *http.Client, method, u, bearer str
 	}
 	defer res.Body.Close()
 	if res.StatusCode/100 != 2 {
-		return &httpStatusError{Method: method, Path: req.URL.Path, Code: res.StatusCode}
+		status := &httpStatusError{Method: method, Path: req.URL.Path, Code: res.StatusCode}
+		if res.StatusCode == http.StatusTooManyRequests {
+			status.RetryAt = retryAfter(res.Header.Get("Retry-After"), time.Now())
+		}
+		return status
 	}
 	const maxResponse = 8 << 20
 	raw, err := io.ReadAll(io.LimitReader(res.Body, maxResponse+1))
@@ -80,8 +86,21 @@ func requestJSON(ctx context.Context, client *http.Client, method, u, bearer str
 type httpStatusError struct {
 	Method, Path string
 	Code         int
+	RetryAt      time.Time
 }
 
 func (e *httpStatusError) Error() string {
 	return fmt.Sprintf("%s %s: unexpected status %d", e.Method, e.Path, e.Code)
+}
+
+// retryAfter accepts both forms defined by HTTP. Missing or invalid hints use
+// Kaneo's default one-minute window; even zero must not cause a hot retry loop.
+func retryAfter(value string, now time.Time) time.Time {
+	if seconds, err := strconv.ParseInt(value, 10, 32); err == nil && seconds >= 0 {
+		return now.Add(max(time.Second, time.Duration(seconds)*time.Second))
+	}
+	if at, err := http.ParseTime(value); err == nil {
+		return now.Add(max(time.Second, at.Sub(now)))
+	}
+	return now.Add(time.Minute)
 }

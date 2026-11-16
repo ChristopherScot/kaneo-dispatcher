@@ -70,6 +70,49 @@ type workflowTask struct {
 	Number  int    `json:"number"`
 }
 
+// workflowRead shares task and relation reads within one validation pass. It is
+// discarded after a board write and between launch gates, so a pod wake or an
+// earlier move cannot leave the next decision using old board facts.
+// A pass is sequential; these maps are never shared between requests.
+type workflowRead struct {
+	*dispatcher
+	tasks      map[string]workflowTask
+	links      map[string][]taskRelation
+	generation uint64
+}
+
+func (d *dispatcher) readWorkflow() *workflowRead {
+	_, generation := d.kaneoLimit.state()
+	return &workflowRead{dispatcher: d, tasks: make(map[string]workflowTask), links: make(map[string][]taskRelation), generation: generation}
+}
+
+func (r *workflowRead) fresh() bool {
+	_, generation := r.kaneoLimit.state()
+	return r.generation == generation
+}
+
+func (r *workflowRead) workflowTask(ctx context.Context, id string) (workflowTask, error) {
+	if task, ok := r.tasks[id]; ok {
+		return task, nil
+	}
+	task, err := r.dispatcher.workflowTask(ctx, id)
+	if err == nil {
+		r.tasks[id] = task
+	}
+	return task, err
+}
+
+func (r *workflowRead) relations(ctx context.Context, id string) ([]taskRelation, error) {
+	if links, ok := r.links[id]; ok {
+		return links, nil
+	}
+	links, err := r.dispatcher.relations(ctx, id)
+	if err == nil {
+		r.links[id] = links
+	}
+	return links, err
+}
+
 var errWorkflowBlocked = errors.New("workflow blocked")
 
 func blocked(format string, args ...any) error {
@@ -125,10 +168,14 @@ func (d *dispatcher) manualTask(ctx context.Context, id string) (bool, error) {
 	return false, nil
 }
 
+func (d *dispatcher) completedWork(ctx context.Context, id string) (bool, error) {
+	return d.readWorkflow().completedWork(ctx, id)
+}
+
 // completedWork requires both board completion and a merge into the repository's
 // current default branch. Closing a PR, or merging it into a feature branch,
 // does not release a dependent task.
-func (d *dispatcher) completedWork(ctx context.Context, id string) (bool, error) {
+func (d *workflowRead) completedWork(ctx context.Context, id string) (bool, error) {
 	task, err := d.workflowTask(ctx, id)
 	if err != nil || task.Status != "done" {
 		return false, err
@@ -184,7 +231,7 @@ func (d *dispatcher) mergedWork(ctx context.Context, id string) (*pullRequest, e
 // prerequisites returns the full dependency closure, ordered before their
 // dependents. Both scheduling and launch gates use this walk, including paths
 // through external tasks; neither can overlook an indirect sibling dependency.
-func (d *dispatcher) prerequisites(ctx context.Context, id string) ([]string, error) {
+func (d *workflowRead) prerequisites(ctx context.Context, id string) ([]string, error) {
 	visiting, visited := map[string]bool{}, map[string]bool{}
 	var dependencies []string
 	var visit func(string) error
@@ -218,7 +265,7 @@ func (d *dispatcher) prerequisites(ctx context.Context, id string) ([]string, er
 	return dependencies, err
 }
 
-func (d *dispatcher) dependenciesReady(ctx context.Context, id string) error {
+func (d *workflowRead) dependenciesReady(ctx context.Context, id string) error {
 	dependencies, err := d.prerequisites(ctx, id)
 	if err != nil {
 		return err
@@ -237,7 +284,7 @@ func (d *dispatcher) dependenciesReady(ctx context.Context, id string) error {
 
 // Child order is a stable topological ordering; ticket number breaks ties.
 // Nested or shared children are rejected until their semantics are supported.
-func (d *dispatcher) workflowOrder(ctx context.Context, parent string, children []string) ([]string, error) {
+func (d *workflowRead) workflowOrder(ctx context.Context, parent string, children []string) ([]string, error) {
 	tasks := map[string]workflowTask{}
 	dependencies := map[string][]string{}
 	for _, id := range children {
@@ -375,7 +422,7 @@ func (d *dispatcher) parentChildren(ctx context.Context, id string) ([]string, b
 
 // A parent can be paused without changing queue state. Validate its identity
 // and manual gate here so orchestration and direct-child launches agree.
-func (d *dispatcher) workflowParentTask(ctx context.Context, id string) (workflowTask, error) {
+func (d *workflowRead) workflowParentTask(ctx context.Context, id string) (workflowTask, error) {
 	task, err := d.workflowTask(ctx, id)
 	if err != nil {
 		return task, err
@@ -406,7 +453,7 @@ func (d *dispatcher) workflowParentTask(ctx context.Context, id string) (workflo
 	return task, nil
 }
 
-func (d *dispatcher) checkWorkflowPlan(ctx context.Context, state *workflow, order []string) error {
+func (d *workflowRead) checkWorkflowPlan(ctx context.Context, state *workflow, order []string) error {
 	if !slices.Equal(state.Order, order) {
 		return blocked("subtask plan changed; restore its relations before resuming")
 	}
@@ -504,26 +551,27 @@ func (d *dispatcher) workflowParent(ctx context.Context, id string, children []s
 	result := cardResult{skipped, id + ": sequential workflow"}
 	children = slices.Clone(children)
 	slices.Sort(children)
+	read := d.readWorkflow()
 	for {
-		parent, err := d.workflowParentTask(ctx, id)
+		parent, err := read.workflowParentTask(ctx, id)
 		if err != nil {
 			return result, err
 		}
 		if parent.Status != authorColumn && parent.Status != strandedColumn {
 			return result, blocked("parent %s is paused in %s", id, parent.Status)
 		}
-		if err := d.dependenciesReady(ctx, id); err != nil {
+		if err := read.dependenciesReady(ctx, id); err != nil {
 			return result, err
 		}
-		// Relations may have changed since the webhook or preceding transition.
-		rels, err := d.relations(ctx, id)
+		// Each board write starts a fresh validation pass.
+		rels, err := read.relations(ctx, id)
 		if err != nil {
 			return result, err
 		}
 		if !slices.Equal(relationChildren(rels, id), children) {
 			return result, blocked("parent %s relations changed", id)
 		}
-		order, err := d.workflowOrder(ctx, id, children)
+		order, err := read.workflowOrder(ctx, id, children)
 		if err != nil {
 			return result, err
 		}
@@ -535,7 +583,7 @@ func (d *dispatcher) workflowParent(ctx context.Context, id string, children []s
 		if newPlan {
 			state = &workflow{Order: order, Phase: readyChild}
 		}
-		if err := d.checkWorkflowPlan(ctx, state, order); err != nil {
+		if err := read.checkWorkflowPlan(ctx, state, order); err != nil {
 			return result, err
 		}
 		seen := workflowObservation{ParentID: id, ParentStatus: parent.Status}
@@ -546,7 +594,7 @@ func (d *dispatcher) workflowParent(ctx context.Context, id string, children []s
 		seen.ParentVisit = work.enteredAt
 		if state.Index < len(order) {
 			child := order[state.Index]
-			task, err := d.workflowTask(ctx, child)
+			task, err := read.workflowTask(ctx, child)
 			if err != nil {
 				return result, err
 			}
@@ -559,7 +607,7 @@ func (d *dispatcher) workflowParent(ctx context.Context, id string, children []s
 			if newPlan {
 				state.BacklogSince = work.enteredAt
 			}
-			seen.ChildDone, err = d.completedWork(ctx, child)
+			seen.ChildDone, err = read.completedWork(ctx, child)
 			if err != nil {
 				return result, err
 			}
@@ -595,9 +643,27 @@ func (d *dispatcher) workflowParent(ctx context.Context, id string, children []s
 			if manual {
 				return result, blocked("%s requires manual work/approval (%s)", decision.Move.Task, manualLabel)
 			}
-			if err := d.dependenciesReady(ctx, decision.Move.Task); err != nil {
+			if err := read.dependenciesReady(ctx, decision.Move.Task); err != nil {
 				return result, err
 			}
+		}
+		var prepared *ticketMove
+		if move := decision.Move; move != nil {
+			event := "child-queued"
+			if move.Task == id {
+				event = "parent-started"
+				if move.To == "done" {
+					event = "parent-completed"
+				}
+			}
+			prepared, err = d.prepareMove(ctx, move.Task, move.From, event, move.Visit)
+			if err != nil {
+				return result, err
+			}
+		}
+		if !read.fresh() {
+			read = d.readWorkflow()
+			continue
 		}
 		if dry {
 			return cardResult{skipped, id + ": sequential workflow [dry-run]"}, nil
@@ -605,36 +671,50 @@ func (d *dispatcher) workflowParent(ctx context.Context, id string, children []s
 		if err := saveState(ctx, d.workflows, cm, id, &decision.State); err != nil {
 			return result, err
 		}
-		if decision.Move == nil {
+		if prepared == nil {
 			continue
 		}
-		move := decision.Move
-		event := "child-queued"
-		if move.Task == id {
-			event = "parent-started"
-			if move.To == "done" {
-				event = "parent-completed"
-			}
-		}
-		ok, err := d.moveTicket(ctx, move.Task, move.From, event, move.Visit, false)
+		ok, err := d.applyMove(ctx, prepared, false)
 		if err != nil {
+			if !prepared.attempted {
+				// Only undo our own claim, and only when PUT was never reached.
+				// A competing writer wins the CAS; its state is never overwritten.
+				if restoreErr := saveState(ctx, d.workflows, cm, id, state); restoreErr != nil {
+					return result, errors.Join(err, restoreErr)
+				}
+			}
 			return result, err
 		}
 		if !ok {
 			return result, errCardChanged
 		}
+		move := decision.Move
 		if move.To == "done" {
 			return cardResult{completed, id + ": all subtasks Done and merged"}, nil
 		}
 		if move.Task != id {
 			return cardResult{redispatched, id + ": activated " + move.Task}, nil
 		}
+		read = d.readWorkflow()
 	}
 }
 
 // workflowGate is used both before waking and immediately before launching.
 // It also applies to direct child drags, so a webhook cannot bypass the queue.
 func (d *dispatcher) workflowGate(ctx context.Context, id string) error {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	for {
+		read := d.readWorkflow()
+		err := read.gate(ctx, id)
+		if err != nil || read.fresh() {
+			return err
+		}
+	}
+}
+
+func (read *workflowRead) gate(ctx context.Context, id string) error {
+	d := read.dispatcher
 	manual, err := d.manualTask(ctx, id)
 	if err != nil {
 		return err
@@ -642,10 +722,10 @@ func (d *dispatcher) workflowGate(ctx context.Context, id string) error {
 	if manual {
 		return blocked("%s requires manual work/approval (%s)", id, manualLabel)
 	}
-	if err := d.dependenciesReady(ctx, id); err != nil {
+	if err := read.dependenciesReady(ctx, id); err != nil {
 		return err
 	}
-	rels, err := d.relations(ctx, id)
+	rels, err := read.relations(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -677,7 +757,7 @@ func (d *dispatcher) workflowGate(ctx context.Context, id string) error {
 	if parent == "" {
 		return nil
 	}
-	task, err := d.workflowParentTask(ctx, parent)
+	task, err := read.workflowParentTask(ctx, parent)
 	if err != nil {
 		return err
 	}
@@ -691,18 +771,18 @@ func (d *dispatcher) workflowGate(ctx context.Context, id string) error {
 	if state == nil || state.Index >= len(state.Order) || state.Order[state.Index] != id {
 		return blocked("%s is not the selected child of %s", id, parent)
 	}
-	rels, err = d.relations(ctx, parent)
+	rels, err = read.relations(ctx, parent)
 	if err != nil {
 		return err
 	}
-	order, err := d.workflowOrder(ctx, parent, relationChildren(rels, parent))
+	order, err := read.workflowOrder(ctx, parent, relationChildren(rels, parent))
 	if err != nil {
 		return err
 	}
-	if err := d.checkWorkflowPlan(ctx, state, order); err != nil {
+	if err := read.checkWorkflowPlan(ctx, state, order); err != nil {
 		return err
 	}
-	return d.dependenciesReady(ctx, parent)
+	return read.dependenciesReady(ctx, parent)
 }
 
 // Membership survives relation deletion. Without this lookup, detaching a

@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"net/url"
 	"path"
 	"strings"
@@ -362,42 +361,4 @@ func (d *dispatcher) completeMergedTask(ctx context.Context, id, column string, 
 		return false, err
 	}
 	return d.moveTicket(ctx, id, column, "merge-observed", work.enteredAt, dry)
-}
-
-func (d *dispatcher) moveTask(ctx context.Context, id, column, target string, dry bool) (bool, error) {
-	p := "/task/" + url.PathEscape(id)
-	var task map[string]any
-	if err := d.kaneo(ctx, p, &task); err != nil {
-		return false, err
-	}
-	if task["id"] == nil || task["projectId"] == nil || task["status"] == nil {
-		return false, fmt.Errorf("task response is missing id, projectId or status")
-	}
-	if task["id"] != id || task["projectId"] != d.project || task["status"] != column {
-		return false, nil
-	}
-	if dry {
-		return true, nil
-	}
-	for k, v := range task {
-		if v == nil {
-			delete(task, k)
-		}
-	}
-	task["status"] = target
-	if err := requestJSON(ctx, d.client, http.MethodPut, d.kaneoURL+"/api"+p, d.apiKey, task, nil); err != nil {
-		return false, err
-	}
-
-	var updated struct {
-		ProjectID string `json:"projectId"`
-		Status    string `json:"status"`
-	}
-	if err := d.kaneo(ctx, p, &updated); err != nil {
-		return false, err
-	}
-	if updated.ProjectID != d.project || updated.Status != target {
-		return false, fmt.Errorf("task update did not leave the card in %s", target)
-	}
-	return true, nil
 }

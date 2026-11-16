@@ -325,3 +325,88 @@ func TestStructuredReworkReceipt(t *testing.T) {
 		t.Fatal("unknown note kind accepted")
 	}
 }
+
+// Inject the same interleaving as another request receiving a 429 between
+// saving a move intent and sending its PUT.
+type cooldownOnMoveStore struct {
+	typedcorev1.ConfigMapInterface
+	d    *dispatcher
+	once sync.Once
+}
+
+func (s *cooldownOnMoveStore) Update(ctx context.Context, cm *corev1.ConfigMap, opts metav1.UpdateOptions) (*corev1.ConfigMap, error) {
+	saved, err := s.ConfigMapInterface.Update(ctx, cm, opts)
+	if err == nil && cm.Data["move.t1"] != "" {
+		s.once.Do(func() { s.d.kaneoLimit.observe(time.Now().Add(time.Minute)) })
+	}
+	return saved, err
+}
+
+func TestLocallyDeferredMoveReleasesOwnedClaims(t *testing.T) {
+	f := newFixture(t)
+	f.stale("to-do")
+	command := commandFor(t, f, "to-do")
+	f.d.workflows = &cooldownOnMoveStore{ConfigMapInterface: f.d.workflows, d: f.d}
+	report := workerReport{Task: "t1", Command: command.ID, PromptDigest: command.Prompt.Digest, Event: "author-started"}
+	var deferred *kaneoDeferredError
+	if err := f.d.acceptReport(t.Context(), report); !errors.As(err, &deferred) {
+		t.Fatalf("expected local deferral, got %v", err)
+	}
+	cm, err := f.d.commandStore(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := readCommand(cm, "t1")
+	if err != nil || current.Phase != "issued" || f.kaneo.puts != 0 {
+		t.Fatalf("unsent move stranded command: command=%+v puts=%d err=%v", current, f.kaneo.puts, err)
+	}
+	// End the test-owned cooldown explicitly; correctness must not depend on
+	// how quickly CI reaches the first PUT admission check.
+	f.d.kaneoLimit.mu.Lock()
+	f.d.kaneoLimit.until = time.Time{}
+	f.d.kaneoLimit.mu.Unlock()
+	if err := f.d.acceptReport(t.Context(), report); err != nil {
+		t.Fatalf("fresh retry did not recover: %v", err)
+	}
+	if f.kaneo.puts != 1 || f.kaneo.tasks["t1"]["status"] != "in-progress" {
+		t.Fatalf("expected exactly one successful move, got %d", f.kaneo.puts)
+	}
+}
+
+func TestWorkerAcceptanceRefreshesWorkflowAfterWait(t *testing.T) {
+	f := workflowFixture(t)
+	f.stale("to-do")
+	f.kaneo.relations = []taskRelation{{"parent", "t1", "subtask"}}
+	if _, err := f.d.workflowParent(t.Context(), "parent", []string{"t1"}, false); err != nil {
+		t.Fatal(err)
+	}
+	command := commandFor(t, f, "to-do")
+	activityReads := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/activity/t1" {
+			activityReads++
+			if activityReads == 2 { // preparation, after workflowGate succeeded
+				f.kaneo.tasks["parent"]["status"] = "backlog"
+				w.Header().Set("Retry-After", "1")
+				w.WriteHeader(http.StatusTooManyRequests)
+				return
+			}
+		}
+		f.kaneo.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	f.d.kaneoURL = srv.URL
+	puts := f.kaneo.puts
+	err := f.d.acceptReport(t.Context(), workerReport{Task: "t1", Command: command.ID, PromptDigest: command.Prompt.Digest, Event: "author-started"})
+	if !errors.Is(err, errWorkflowBlocked) || f.kaneo.puts != puts || f.kaneo.tasks["t1"]["status"] != "to-do" {
+		t.Fatalf("accepted child of paused parent: puts=%d err=%v", f.kaneo.puts, err)
+	}
+	cm, err := f.d.commandStore(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := readCommand(cm, "t1")
+	if err != nil || current.Phase != "issued" {
+		t.Fatalf("claim saved before refreshed validation: command=%+v err=%v", current, err)
+	}
+}

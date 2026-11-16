@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -115,56 +116,104 @@ func (d *dispatcher) issueCommand(ctx context.Context, id, repo, column string, 
 	return command, nil
 }
 
-// A move is a one-shot intent, saved before PUT. An uncertain PUT is never
-// replayed against the same column visit, even after a process restart.
-func (d *dispatcher) moveTicket(ctx context.Context, id, column, event string, expectedVisit time.Time, dry bool) (bool, error) {
+// A move is prepared from fresh board facts before its one-shot intent is
+// claimed. No Kaneo reads (and therefore no rate-limit waits) separate that
+// claim from PUT. An uncertain PUT is never replayed against the same visit.
+type ticketMove struct {
+	intent    workflowMove
+	task      map[string]any
+	attempted bool
+}
+
+func (d *dispatcher) prepareMove(ctx context.Context, id, column, event string, expectedVisit time.Time) (*ticketMove, error) {
 	target, err := fsmEvent(ctx, newTicketFSM(column), event)
 	if err != nil {
-		return false, err
+		return nil, err
+	}
+	var task map[string]any
+	if err := d.kaneo(ctx, "/task/"+url.PathEscape(id), &task); err != nil {
+		return nil, err
+	}
+	if task["id"] != id || task["projectId"] != d.project || task["status"] != column {
+		return nil, errCardChanged
 	}
 	work, err := d.taskWork(ctx, id, stage{})
 	if err != nil {
-		return false, err
+		return nil, err
 	}
-	task, err := d.workflowTask(ctx, id)
-	if err != nil {
-		return false, err
+	if !work.enteredAt.Equal(expectedVisit) {
+		return nil, errCardChanged
 	}
-	if task.Status != column || !work.enteredAt.Equal(expectedVisit) {
-		return false, errCardChanged
+	for k, v := range task {
+		if v == nil {
+			delete(task, k)
+		}
 	}
-	if column == target {
+	task["status"] = target
+	return &ticketMove{intent: workflowMove{Task: id, From: column, To: target, Visit: expectedVisit}, task: task}, nil
+}
+
+func (d *dispatcher) applyMove(ctx context.Context, move *ticketMove, dry bool) (bool, error) {
+	intent := move.intent
+	if dry || intent.From == intent.To {
 		return true, nil
-	}
-	if dry {
-		return d.moveTask(ctx, id, column, target, true)
 	}
 	cm, err := d.commandStore(ctx)
 	if err != nil {
 		return false, err
 	}
 	var previous workflowMove
-	key := "move." + id
+	key := "move." + intent.Task
 	if raw := cm.Data[key]; raw != "" {
 		if err := json.Unmarshal([]byte(raw), &previous); err != nil {
 			return false, err
 		}
-		if previous.From == column && previous.Visit.Equal(work.enteredAt) {
-			return false, blocked("previous move of %s has an uncertain outcome", id)
+		if previous.From == intent.From && previous.Visit.Equal(intent.Visit) {
+			return false, blocked("previous move of %s has an uncertain outcome", intent.Task)
 		}
 	}
-	intent := workflowMove{Task: id, From: column, To: target, Visit: work.enteredAt}
 	if err := d.saveCommandRecord(ctx, cm, key, &intent); err != nil {
 		return false, err
 	}
-	fresh, err := d.taskWork(ctx, id, stage{})
+	move.attempted = true // conservatively retain both intents from here onward
+	p := "/task/" + url.PathEscape(intent.Task)
+	if err := d.kaneoRequest(ctx, http.MethodPut, p, move.task, nil); err != nil {
+		var deferred *kaneoDeferredError
+		if errors.As(err, &deferred) {
+			// saveCommandRecord only restores this record if our claim still
+			// owns it; unrelated ConfigMap writes may be safely rebased.
+			if restoreErr := d.saveCommandRecord(ctx, cm, key, &previous); restoreErr != nil {
+				return false, errors.Join(err, restoreErr)
+			}
+			move.attempted = false
+		}
+		return false, err
+	}
+	var updated struct {
+		ProjectID string `json:"projectId"`
+		Status    string `json:"status"`
+	}
+	if err := d.kaneo(ctx, p, &updated); err != nil {
+		return false, err
+	}
+	if updated.ProjectID != d.project || updated.Status != intent.To {
+		return false, fmt.Errorf("task update did not leave the card in %s", intent.To)
+	}
+	return true, nil
+}
+
+func (d *dispatcher) moveTicket(ctx context.Context, id, column, event string, expectedVisit time.Time, dry bool) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	_, generation := d.kaneoLimit.state()
+	move, err := d.prepareMove(ctx, id, column, event, expectedVisit)
 	if err != nil {
 		return false, err
 	}
-	if !fresh.enteredAt.Equal(work.enteredAt) {
-		return false, errCardChanged
+	if _, current := d.kaneoLimit.state(); current != generation {
+		return false, errKaneoObservationChanged
 	}
-	return d.moveTask(ctx, id, column, target, false)
+	return d.applyMove(ctx, move, dry)
 }
 
 type workerReport = protocol.Report
@@ -209,6 +258,18 @@ func (d *dispatcher) workerEvent(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d *dispatcher) acceptReport(ctx context.Context, report workerReport) error {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	for {
+		err := d.acceptReportAttempt(ctx, report)
+		if !errors.Is(err, errKaneoObservationChanged) {
+			return err
+		}
+	}
+}
+
+func (d *dispatcher) acceptReportAttempt(ctx context.Context, report workerReport) error {
+	_, generation := d.kaneoLimit.state()
 	cm, err := d.commandStore(ctx)
 	if err != nil {
 		return err
@@ -247,6 +308,9 @@ func (d *dispatcher) acceptReport(ctx context.Context, report workerReport) erro
 		if err := d.workflowGate(ctx, report.Task); err != nil {
 			return err
 		}
+	}
+	if _, current := d.kaneoLimit.state(); current != generation {
+		return errKaneoObservationChanged
 	}
 	switch report.Event {
 	case "note", "link":
@@ -291,12 +355,25 @@ func (d *dispatcher) acceptReport(ctx context.Context, report workerReport) erro
 			return blocked("no qualifying commanded merge")
 		}
 	}
+	prepared, err := d.prepareMove(ctx, report.Task, task.Status, report.Event, command.Visit)
+	if err != nil {
+		return err
+	}
+	if _, current := d.kaneoLimit.state(); current != generation {
+		return errKaneoObservationChanged
+	}
+	previous := *command
 	command.Phase = phase
 	if err := d.saveCommandRecord(ctx, cm, report.Task, command); err != nil {
 		return err
 	}
-	changed, err := d.moveTicket(ctx, report.Task, task.Status, report.Event, command.Visit, false)
+	changed, err := d.applyMove(ctx, prepared, false)
 	if err != nil {
+		if !prepared.attempted {
+			if restoreErr := d.saveCommandRecord(ctx, cm, report.Task, &previous); restoreErr != nil {
+				return errors.Join(err, restoreErr)
+			}
+		}
 		return err
 	}
 	if !changed {
@@ -398,7 +475,7 @@ func (d *dispatcher) workerArtifact(ctx context.Context, report workerReport) er
 	} else if report.Message == "" {
 		return fmt.Errorf("empty note")
 	}
-	return requestJSON(ctx, d.client, http.MethodPost, d.kaneoURL+"/api"+p, d.apiKey, body, nil)
+	return d.kaneoRequest(ctx, http.MethodPost, p, body, nil)
 }
 
 func (d *dispatcher) authorizeGitHub(ctx context.Context, cm *corev1.ConfigMap, report workerReport, command *workerCommand) error {
