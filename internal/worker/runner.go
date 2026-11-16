@@ -4,6 +4,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -135,7 +136,12 @@ func (r *runner) execute(ctx context.Context) error {
 		return r.outcome(ctx, "blocked")
 	}
 	if err := r.checkout(ctx); err != nil {
-		return err
+		// Execution was accepted, but no stage work has begun. Preserve the
+		// checkout and report a setup block even if execution was cancelled;
+		// otherwise the dispatcher mistakes an exited worker for active work.
+		reportCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
+		defer cancel()
+		return errors.Join(err, r.block(reportCtx, fmt.Sprintf("Worker setup failed for command %s in %s: %s. Existing work was preserved.", r.cfg.Command, r.dir, r.redact(err.Error()))))
 	}
 	switch r.cfg.Stage {
 	case "author":
