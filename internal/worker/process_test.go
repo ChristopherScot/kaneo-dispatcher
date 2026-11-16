@@ -92,6 +92,17 @@ func TestLockAcknowledgmentFencesLaunches(t *testing.T) {
 		t.Fatalf("failed acknowledgment retained lock: %v", err)
 	}
 	other.Close()
+	if err := os.WriteFile(lockPath+".stopping", nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if other, err := acquireLock(lockPath, busy); err == nil {
+		other.Close()
+		t.Fatal("shutdown allowed a new command")
+	}
+	raw, err = os.ReadFile(busy)
+	if err != nil || string(raw) != "busy\n" {
+		t.Fatalf("shutdown ack=%q, %v", raw, err)
+	}
 }
 
 func TestLockSurvivesWorkerDeath(t *testing.T) {

@@ -181,6 +181,16 @@ func acquireLock(path, ack string) (*os.File, error) {
 		}
 		return nil, fmt.Errorf("pod lock: %w", err)
 	}
+	// The pod preStop hook creates this before signalling workers. Check
+	// under the lock so a queued launch cannot start during shutdown.
+	if _, err := os.Stat(path + ".stopping"); !errors.Is(err, os.ErrNotExist) {
+		_ = f.Close()
+		if err != nil {
+			return nil, err
+		}
+		_ = acknowledge(ack, "busy")
+		return nil, fmt.Errorf("pod shutting down")
+	}
 	if err = acknowledge(ack, "accepted"); err != nil {
 		_ = f.Close()
 		return nil, err

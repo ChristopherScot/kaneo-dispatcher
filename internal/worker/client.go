@@ -92,7 +92,7 @@ func (r *runner) fetch(ctx context.Context) error {
 	valid := false
 	switch p.Stage {
 	case "author":
-		valid = p.Result == "author-v1" && (p.Mode == "author" || p.Mode == "resume" || p.Mode == "rework" || p.Mode == "advance" || p.Mode == "blocked")
+		valid = p.Result == "author-v1" && (p.Mode == "author" || p.Mode == "resume" || p.Mode == "rework" || p.Mode == "blocked")
 	case "test":
 		valid = p.Result == "test-verdict-v1" && p.Mode == "test"
 	case "merge":

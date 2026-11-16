@@ -10,47 +10,93 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/ChristopherScot/kaneo-dispatcher/internal/protocol"
 )
 
 func (r *runner) author(ctx context.Context) error {
 	text, runErr := r.claude(ctx)
-	// Publish even after an interrupted author run: local commits are useful
-	// recovery evidence, but a failed execution is never a successful outcome.
-	ahead, err := r.git(ctx, "rev-list", "--count", r.payload.BaseSHA+"..refs/heads/"+r.payload.Branch)
-	if err != nil {
-		return errors.Join(runErr, err)
+	// Claude and its descendants have exited. Give preservation its own
+	// budget so a cancelled run can still publish its unfinished work.
+	preserveCtx, preserveCancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
+	checkpoint, preserveErr := r.preserveAuthor(preserveCtx)
+	preserveCancel()
+	if ctx.Err() != nil {
+		runErr = errors.Join(runErr, ctx.Err())
+		// Normal reporting retains its HTTP budget, including dispatcher
+		// rate-limit waits. Only shutdown must fit the pod's grace period.
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
 	}
-	count, err := strconv.Atoi(ahead)
-	if err != nil || count < 0 {
-		return errors.Join(runErr, fmt.Errorf("invalid authored commit count %q", ahead))
+	if preserveErr != nil {
+		return errors.Join(runErr, preserveErr, r.block(ctx, "Could not publish unfinished author work; the local checkout was retained: "+r.redact(preserveErr.Error())))
 	}
-	if count > 0 {
-		if _, err := r.git(ctx, "push", "-u", "origin", "refs/heads/"+r.payload.Branch+":refs/heads/"+r.payload.Branch); err != nil {
-			return errors.Join(runErr, fmt.Errorf("preserve authored commits: %w", err))
+	if checkpoint || runErr != nil {
+		reason := "Author execution did not complete. Recovery branch: " + r.payload.Branch + "."
+		if checkpoint {
+			reason += " Uncommitted changes were saved in a stash: checkpoint commit."
 		}
+		if runErr != nil {
+			reason += "\n" + r.redact(runErr.Error())
+		}
+		return errors.Join(runErr, r.block(ctx, reason))
 	}
 	pr, err := r.authoredPR(ctx)
 	if err != nil {
-		return errors.Join(runErr, err)
+		return err
 	}
 	if pr.Number == 0 {
-		if runErr != nil {
-			text += "\n" + runErr.Error()
-		}
 		if err := r.note(ctx, "The author produced no open pull request.\n\n"+r.evidence(text)); err != nil {
-			return errors.Join(runErr, err)
+			return err
 		}
-		return errors.Join(runErr, r.outcome(ctx, "failed"))
+		return r.outcome(ctx, "failed")
 	}
 	if err := r.report(ctx, protocol.Report{Event: "link", URL: pr.URL, Title: "open"}); err != nil {
-		return errors.Join(runErr, err)
-	}
-	if runErr != nil {
-		return runErr
+		return err
 	}
 	return r.outcome(ctx, "succeeded")
+}
+
+// preserveAuthor checkpoints only the commanded branch. Never publish a
+// different checkout or force away work that another actor has pushed.
+func (r *runner) preserveAuthor(ctx context.Context) (bool, error) {
+	branch, err := r.git(ctx, "symbolic-ref", "--quiet", "HEAD")
+	if err != nil {
+		return false, err
+	}
+	ref := "refs/heads/" + r.payload.Branch
+	if branch != ref {
+		return false, fmt.Errorf("author checkout changed to %q; checkpoint held", branch)
+	}
+	dirty, err := r.git(ctx, "status", "--porcelain", "--untracked-files=all")
+	if err != nil {
+		return false, err
+	}
+	checkpoint := dirty != ""
+	if checkpoint {
+		if _, err := r.git(ctx, "add", "--all"); err != nil {
+			return false, err
+		}
+		if _, err := r.git(ctx, "commit", "-m", "stash: unfinished work for "+r.cfg.Task+" ("+r.cfg.Command+")"); err != nil {
+			return false, err
+		}
+	}
+	ahead, err := r.git(ctx, "rev-list", "--count", r.payload.BaseSHA+".."+ref)
+	if err != nil {
+		return checkpoint, err
+	}
+	count, err := strconv.Atoi(ahead)
+	if err != nil || count < 0 {
+		return checkpoint, fmt.Errorf("invalid authored commit count %q", ahead)
+	}
+	if count > 0 {
+		if _, err := r.git(ctx, "push", "-u", "origin", ref+":"+ref); err != nil {
+			return checkpoint, fmt.Errorf("preserve authored commits: %w", err)
+		}
+	}
+	return checkpoint, nil
 }
 
 type authoredPullRequest struct {

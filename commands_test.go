@@ -410,3 +410,62 @@ func TestWorkerAcceptanceRefreshesWorkflowAfterWait(t *testing.T) {
 		t.Fatalf("claim saved before refreshed validation: command=%+v err=%v", current, err)
 	}
 }
+
+func TestAuthorContractGuardsCompletion(t *testing.T) {
+	for _, tc := range []struct{ mode, event string }{
+		{"advance", "author-started"},
+		{"advance", "author-succeeded"},
+		{"blocked", "author-succeeded"},
+		{"missing", "author-succeeded"},
+	} {
+		t.Run(tc.mode+"/"+tc.event, func(t *testing.T) {
+			f := newFixture(t)
+			f.stale("to-do")
+			command := commandFor(t, f, "to-do")
+			if tc.event == "author-succeeded" && reportTo(t, f, command, "author-started") != 200 {
+				t.Fatal("start refused")
+			}
+			cm, err := f.d.commandStore(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			stored, err := readCommand(cm, "t1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.mode == "missing" {
+				stored.Prompt = nil
+			} else {
+				var payload promptPayload
+				if err := json.Unmarshal([]byte(stored.Prompt.Payload), &payload); err != nil {
+					t.Fatal(err)
+				}
+				payload.Mode = tc.mode
+				raw, err := json.Marshal(payload)
+				if err != nil {
+					t.Fatal(err)
+				}
+				stored.Prompt.Template, stored.Prompt.Payload, stored.Prompt.Digest = tc.mode, string(raw), digest(string(raw))
+				command.Prompt = stored.Prompt
+			}
+			if err := f.d.saveCommandRecord(t.Context(), cm, "t1", stored); err != nil {
+				t.Fatal(err)
+			}
+			puts := f.kaneo.puts
+			if got := reportTo(t, f, command, tc.event); got != 409 {
+				t.Fatalf("invalid contract accepted: %d", got)
+			}
+			if f.kaneo.puts != puts {
+				t.Fatal("invalid contract moved the board")
+			}
+			cm, err = f.d.commandStore(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			after, err := readCommand(cm, "t1")
+			if err != nil || after.Phase != stored.Phase {
+				t.Fatalf("invalid contract claimed command: %+v %v", after, err)
+			}
+		})
+	}
+}

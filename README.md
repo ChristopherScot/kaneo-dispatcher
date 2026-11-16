@@ -80,7 +80,8 @@ performs reads only. The `kaneo-reconcile` CronJob remains the caller.
 The dispatcher embeds the Markdown files in `prompts/` and freezes one selected
 template, ticket description/comments, repository revisions, execution timeout
 and result contract when issuing a command. Author commands explicitly select
-fresh work, rework, resume, advance-without-Claude or human review. GitHub lookup
+fresh work, rework, resume or human review. An existing PR still requires
+author execution before a completion report. GitHub lookup
 failures hold the task; only a confirmed missing branch means fresh work.
 
 `POST /worker-command` returns the persisted snapshot to the authenticated worker
