@@ -9,9 +9,12 @@ import (
 	"log/slog"
 	"net/url"
 	"path"
+	"slices"
 	"strings"
 	"time"
 )
+
+var errSweepRunning = errors.New("reconcile already running")
 
 // sweep is what one reconcile pass found, as lines a human reads in the
 // log. Returned rather than only logged, so the summary says what
@@ -66,7 +69,13 @@ func sweeps(column string) (stage, bool) {
 // read at all; everything per card lands in the sweep's errors instead,
 // so one bad card does not hide the rest.
 func (d *dispatcher) reconcile(ctx context.Context, dryRun bool) (sweep, error) {
+	if !d.sweepMu.TryLock() {
+		return sweep{}, errSweepRunning
+	}
+	defer d.sweepMu.Unlock()
 	var out sweep
+	var queue []queuedCard
+	blockedStages := map[int]bool{}
 	var b board
 	if err := d.kaneo(ctx, "/task/tasks/"+url.PathEscape(d.project), &b); err != nil {
 		return out, err
@@ -80,12 +89,15 @@ func (d *dispatcher) reconcile(ctx context.Context, dryRun bool) (sweep, error) 
 		}
 		for _, c := range col.Tasks {
 			out.checked++
-			result, err := d.reconcileCard(ctx, col.Slug, c, dryRun, b)
+			result, err := d.reconcileCard(ctx, col.Slug, c, dryRun, b, &queue)
 			if err != nil {
 				if errors.Is(err, errWorkflowBlocked) {
 					out.skipped = append(out.skipped, c.name()+": "+err.Error())
 				} else {
 					out.errors = append(out.errors, c.name()+": "+err.Error())
+					if st, ok := sweeps(col.Slug); ok {
+						blockedStages[st.ordinal] = true
+					}
 				}
 				continue
 			}
@@ -99,6 +111,27 @@ func (d *dispatcher) reconcile(ctx context.Context, dryRun bool) (sweep, error) 
 			}
 		}
 	}
+	slices.SortFunc(queue, compareQueuedCards)
+	for _, next := range queue {
+		if blockedStages[next.stage.ordinal] {
+			continue
+		}
+		blockedStages[next.stage.ordinal] = true
+		if dryRun {
+			out.redispatched = append(out.redispatched, next.detail+" [dry-run]")
+			continue
+		}
+		slog.Info("reconcile: stuck card, re-dispatching", "task", next.card.name(), "column", next.column, "priority", next.card.Priority)
+		if err := d.runStage(ctx, next.repo, next.stage, next.card, next.column); err != nil {
+			if errors.Is(err, errPodBusy) || errors.Is(err, errCardChanged) || errors.Is(err, errWorkStarted) || errors.Is(err, errWorkflowBlocked) {
+				out.skipped = append(out.skipped, next.card.name()+": "+err.Error())
+			} else {
+				out.errors = append(out.errors, next.card.name()+": "+err.Error())
+			}
+			continue
+		}
+		out.redispatched = append(out.redispatched, next.detail)
+	}
 	return out, nil
 }
 
@@ -107,7 +140,7 @@ func (d *dispatcher) reconcile(ctx context.Context, dryRun bool) (sweep, error) 
 // find out lands in errors, never in silence: an error here must not
 // read as "nothing to do", because a card nobody can see is the failure
 // this sweep exists for.
-func (d *dispatcher) reconcileCard(ctx context.Context, column string, c card, dryRun bool, b board) (cardResult, error) {
+func (d *dispatcher) reconcileCard(ctx context.Context, column string, c card, dryRun bool, b board, queue *[]queuedCard) (cardResult, error) {
 	children, isParent, err := d.parentChildren(ctx, c.ID)
 	if err != nil {
 		return cardResult{}, err
@@ -187,7 +220,11 @@ func (d *dispatcher) reconcileCard(ctx context.Context, column string, c card, d
 			return cardResult{}, fmt.Errorf("createdAt %q: %w", c.CreatedAt, err)
 		}
 	}
-	delay := d.unclaimed
+	enteredAt := since
+	delay := time.Duration(0)
+	if column == strandedColumn {
+		delay = d.unclaimed
+	}
 	if !work.startedAt.IsZero() {
 		since = work.startedAt
 		delay = d.stale
@@ -202,20 +239,13 @@ func (d *dispatcher) reconcileCard(ctx context.Context, column string, c card, d
 		return cardResult{skipped, c.name() + ": " + st.pod() + " does not work " + repo}, nil
 	}
 	line := fmt.Sprintf("%s (%s, %dh)", c.name(), column, int(age.Hours()))
-	if dryRun {
-		return cardResult{redispatched, line + " [dry-run]"}, nil
-	}
-	slog.Info("reconcile: stuck card, re-dispatching", "task", c.name(), "column", column, "since", since)
-	// A wake or launch that failed is an error, not a redispatch: the
-	// summary line is what a morning reads, and "redispatched 1" over a
-	// card that never started is worse than silence.
-	if err := d.runStage(ctx, repo, st, c, column); err != nil {
-		if errors.Is(err, errPodBusy) || errors.Is(err, errCardChanged) || errors.Is(err, errWorkStarted) || errors.Is(err, errWorkflowBlocked) {
-			return cardResult{skipped, c.name() + ": " + err.Error()}, nil
-		}
+	priority, err := priorityRank(c.Priority)
+	if err != nil {
 		return cardResult{}, err
 	}
-	return cardResult{redispatched, line}, nil
+	c.queueVisit = &work.enteredAt
+	*queue = append(*queue, queuedCard{card: c, column: column, stage: st, repo: repo, enteredAt: enteredAt, priority: priority, detail: line})
+	return cardResult{}, nil
 }
 
 // Workers post this exact marker after acquiring their lock and reaching the
@@ -271,14 +301,11 @@ func (d *dispatcher) github(ctx context.Context, p string, out any) error {
 // runSweep is reconcile plus its log lines, for the handler that runs it
 // after answering.
 func (d *dispatcher) runSweep(ctx context.Context, dryRun bool) {
-	// The HTTP trigger returns 202 before finishing; CronJob Forbid alone
-	// cannot prevent the next minute's request from overlapping a slow wake.
-	if !d.sweepMu.TryLock() {
+	s, err := d.reconcile(ctx, dryRun)
+	if errors.Is(err, errSweepRunning) {
 		slog.Info("reconcile already running")
 		return
 	}
-	defer d.sweepMu.Unlock()
-	s, err := d.reconcile(ctx, dryRun)
 	if err != nil {
 		slog.Error("reconcile failed", "err", err)
 		return

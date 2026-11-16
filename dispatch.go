@@ -199,7 +199,9 @@ type card struct {
 	// payload does not even carry it.
 	TicketID string `json:"ticketId"`
 	// CreatedAt is the sweep's clock for a card that was never moved.
-	CreatedAt string `json:"createdAt"`
+	CreatedAt  string `json:"createdAt"`
+	Priority   string `json:"priority"`
+	queueVisit *time.Time
 }
 
 // name is what the log calls the card.
@@ -253,7 +255,7 @@ func (d *dispatcher) webhook(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("unknown board transition", "err", err)
 		return
 	}
-	st, ok := routes[column]
+	_, ok = routes[column]
 	if !ok {
 		// Inert columns are logged, not dropped: this is the audit trail
 		// of every card movement, Chris's included.
@@ -264,7 +266,7 @@ func (d *dispatcher) webhook(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("skip", "task", ev.Task.name(), "column", column, "reason", "payload names no task id")
 		return
 	}
-	d.detach(r, func(ctx context.Context) { d.dispatch(ctx, column, st, ev.Task) })
+	d.detach(r, func(ctx context.Context) { d.runSweep(ctx, false) })
 }
 
 // detach runs work after the response has gone. The context keeps the
@@ -273,58 +275,6 @@ func (d *dispatcher) webhook(w http.ResponseWriter, r *http.Request) {
 func (d *dispatcher) detach(r *http.Request, work func(ctx context.Context)) {
 	ctx := context.WithoutCancel(r.Context())
 	d.inflight.Go(func() { work(ctx) })
-}
-
-// dispatch runs the stage a column implies for one card, or logs one line
-// saying why not.
-func (d *dispatcher) dispatch(ctx context.Context, column string, st stage, c card) {
-	children, isParent, err := d.parentChildren(ctx, c.ID)
-	if err != nil {
-		slog.Error("read workflow", "task", c.ID, "err", err)
-		return
-	}
-	if isParent {
-		result, err := d.workflowParent(ctx, c.ID, children, false)
-		slog.Info("workflow", "task", c.ID, "result", result.detail, "err", err)
-		return
-	}
-	repo, skip, err := d.repoFor(ctx, c.ID, st)
-	if err != nil {
-		slog.Error("cannot read labels", "task", c.name(), "column", column, "err", err)
-		return
-	}
-	if skip != "" {
-		slog.Warn("skip", "task", c.name(), "column", column, "reason", skip)
-		return
-	}
-	if err := d.runStage(ctx, repo, st, c, column); err != nil {
-		if errors.Is(err, errPodBusy) || errors.Is(err, errCardChanged) || errors.Is(err, errWorkStarted) || errors.Is(err, errWorkflowBlocked) {
-			slog.Warn("skip", "task", c.name(), "column", column, "repo", repo, "reason", err)
-			return
-		}
-		slog.Error("dispatch failed", "task", c.name(), "column", column, "repo", repo, "err", err)
-	}
-}
-
-// repoFor is the repo a card's stage should run against, or the one-line
-// reason it should not run at all. The two reasons are the same for the
-// webhook and the sweep, so they are decided here and only worded here.
-//
-// An error is a Kaneo lookup that failed, which must not read as "no
-// label": saying so keeps a Kaneo outage from looking like a board full
-// of unlabelled cards.
-func (d *dispatcher) repoFor(ctx context.Context, id string, st stage) (repo, skip string, err error) {
-	repo, ok, err := d.repoForTask(ctx, id)
-	if err != nil {
-		return "", "", err
-	}
-	if !ok {
-		return "", "card needs exactly one repo: label", nil
-	}
-	if !d.podWorksRepo(st, repo) {
-		return "", st.pod() + " does not work " + repo, nil
-	}
-	return repo, "", nil
 }
 
 var (
@@ -347,6 +297,7 @@ func (d *dispatcher) runStage(ctx context.Context, repo string, st stage, c card
 		ID        string `json:"id"`
 		ProjectID string `json:"projectId"`
 		Status    string `json:"status"`
+		Priority  string `json:"priority"`
 	}
 	if err := d.kaneo(ctx, "/task/"+url.PathEscape(c.ID), &current); err != nil {
 		return err
@@ -362,6 +313,9 @@ func (d *dispatcher) runStage(ctx context.Context, repo string, st stage, c card
 	work, err := d.taskWork(ctx, c.ID, st)
 	if err != nil {
 		return err
+	}
+	if c.queueVisit != nil && (!work.enteredAt.Equal(*c.queueVisit) || current.Priority != c.Priority) {
+		return errCardChanged
 	}
 	if !work.startedAt.IsZero() && time.Since(work.startedAt) < d.stale {
 		return errWorkStarted
@@ -390,6 +344,9 @@ func (d *dispatcher) runStage(ctx context.Context, repo string, st stage, c card
 		return fmt.Errorf("launch in %s: %w", pod, err)
 	}
 	if rc == 75 {
+		if err := d.rejectLaunch(ctx, c.ID, command.ID); err != nil {
+			return fmt.Errorf("release rejected launch: %w", err)
+		}
 		return errPodBusy
 	}
 	if rc != 0 {

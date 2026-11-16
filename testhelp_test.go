@@ -163,7 +163,21 @@ func (s *stubKaneo) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = json.NewEncoder(w).Encode(acts)
 	case strings.HasPrefix(r.URL.Path, "/api/task/tasks/"):
-		_ = json.NewEncoder(w).Encode(s.board)
+		if s.board != nil {
+			_ = json.NewEncoder(w).Encode(s.board)
+			break
+		}
+		columns := []map[string]any{}
+		for _, status := range []string{"backlog", "to-do", "in-progress", "in-review", "mergeable", "needs-human-review", "done"} {
+			tasks := []map[string]any{}
+			for _, task := range s.tasks {
+				if task["status"] == status {
+					tasks = append(tasks, task)
+				}
+			}
+			columns = append(columns, map[string]any{"slug": status, "tasks": tasks})
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"columns": columns}})
 	case strings.HasPrefix(r.URL.Path, "/api/task/"):
 		id := strings.TrimPrefix(r.URL.Path, "/api/task/")
 		if r.Method == http.MethodPut {
@@ -344,7 +358,7 @@ func (f *fixture) signed(path, body string) *httptest.ResponseRecorder {
 	var event delivery
 	if json.Unmarshal([]byte(body), &event) == nil && event.Task.ID != "" {
 		if _, ok := f.kaneo.tasks[event.Task.ID]; !ok {
-			f.kaneo.tasks[event.Task.ID] = map[string]any{"id": event.Task.ID, "projectId": f.d.project, "status": event.Data.NewStatus}
+			f.kaneo.tasks[event.Task.ID] = map[string]any{"id": event.Task.ID, "projectId": f.d.project, "status": event.Data.NewStatus, "ticketId": event.Task.TicketID, "createdAt": ago(time.Minute)}
 		}
 	}
 	return f.post(path, body, "X-Kaneo-Signature", sign(body))

@@ -12,11 +12,7 @@ func TestJSONResponseValidation(t *testing.T) {
 	for _, body := range []string{`{"error":"upstream unavailable"}`, `null`, `{}`, `{"data":{}}`, `{"data":{"columns":null}}`} {
 		t.Run(body, func(t *testing.T) {
 			f := newFixture(t)
-			var decoded any
-			if err := json.Unmarshal([]byte(body), &decoded); err != nil {
-				t.Fatal(err)
-			}
-			f.kaneo.board = decoded
+			f.kaneo.board = json.RawMessage(body)
 			if _, err := f.d.reconcile(t.Context(), false); err == nil {
 				t.Fatalf("reconcile accepted invalid board %s", body)
 			}

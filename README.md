@@ -19,7 +19,8 @@ step with the column graph written down in
    mismatch). Nothing runs for an unsigned request.
 2. 202 is answered before any work, so Kaneo's delivery health does not
    wait on a pod.
-3. The card's `repo:<name>` label is read back from the Kaneo API - the
+3. The shared queue selects the next eligible card for each stage. Its
+   `repo:<name>` label is read back from the Kaneo API - the
    payload carries no labels - resolved to `owner/name`, and checked
    against the list of repos the target pod works (`REPOS_POD<n>`).
 4. The `claude-session` StatefulSet is woken: scaled to one past the
@@ -57,6 +58,9 @@ after the command's stage, repository, dependencies and column visit are checked
 
 - An issued command without a start signal can be replaced after
   `RECONCILE_UNCLAIMED` (15m).
+- A definite busy acknowledgment sends `launch-rejected` through the command
+  FSM (`issued → finished`) and releases the reservation. Missing acknowledgments
+  retain it, including if the card is moved meanwhile, until the retry timeout.
 - A running command gets `RECONCILE_STALE` (4h) before replacement is eligible.
 - Moving a card invalidates the old command's visit, even when it returns to the
   same column. A replacement command invalidates the previous command ID.
@@ -66,14 +70,41 @@ after the command's stage, repository, dependencies and column visit are checked
 Historical work-start comments are still recognized during rollout. New workers
 report starts to the dispatcher rather than posting their own receipt comments.
 
-The CronJob sweeps every minute, so an unclaimed card is normally eligible
-within 15–16 minutes. Busy pods remain protected by their lock. Slow sweeps
-are serialized, and pending launches recheck the start signal after waking.
-Stale In Progress cards return to the author, whose mode logic decides how
-to resume. Existing PRs or integration statuses do not suppress retries:
-the stage owns recovery of unfinished work. Unmerged human-review cards remain parked. Busy workers are
-reported as skipped, and failed launches as errors. `POST /reconcile?dry`
-performs reads only. The `kaneo-reconcile` CronJob remains the caller.
+## Priority queues
+
+Status webhooks, worker completion reports, and the every-minute reconciler all
+select from the same board queues. Each worker stage has one slot. Eligible
+cards are selected **Urgent → High → Medium → Low → No priority**, with FIFO
+within each priority. FIFO uses the latest status-change timestamp, or creation
+time for a card created directly in its current column. Equal timestamps use
+raw task ID as a deterministic tie-breaker; board position and webhook delivery
+order do not affect selection.
+
+New cards in To Do, In Review, or Mergeable are eligible immediately, including
+when their webhook was missed. Moving away and back puts a card at the back of
+its priority's queue. Changing priority retains its current column-entry time
+and takes effect at the next selection. A selection already in progress is not
+preempted; running workers finish normally. Strict priority can starve lower
+priorities while higher-priority work keeps arriving.
+
+Manual cards, unmet dependencies, and inactive workflow children remain gated.
+Priority does not reorder a parent's frozen child plan. Stale In Progress cards
+share the author queue, retaining the 15-minute recovery grace if no worker
+start was recorded. Issued and running commands retain the retry timeouts above.
+Unacknowledged stage reservations survive restarts and are checked on ConfigMap CAS retries,
+so overlapping dispatcher instances cannot issue fresh commands to the same
+slot. Once a worker acknowledges starting, its lock protects the running stage;
+a stopped worker does not hold other cards behind its retry timeout. An uncertain transitional
+command or merge holds its stage for explicit recovery.
+
+Slow sweeps are coalesced; changes arriving during one are picked up by the
+next webhook or minute sweep. Each pass attempts at most one card per stage.
+Read failures that prevent ordering hold the affected stage for that pass.
+Existing PRs or integration statuses do not suppress recovery: the stage owns
+resuming unfinished work. Unmerged human-review cards remain parked. Busy
+workers are reported as skipped, and failed launches as errors.
+`POST /reconcile?dry` performs reads only and reports the next selected cards.
+The `kaneo-reconcile` CronJob remains the caller.
 
 ## Dispatcher-owned prompts
 
@@ -245,8 +276,8 @@ outside Backlog block progress. Both webhook and reconcile launches enforce
 these gates, including a recheck after waking pods. Removing a relation cannot
 turn a saved child or parent into unrestricted standalone work.
 
-An active child retains the existing 15-minute unclaimed / four-hour started
-retry policy. A child returned to Backlog or parked for human review holds its
+An active child joins its stage priority queue and retains the 15-minute
+issued-command / four-hour started retry policy. A child returned to Backlog or parked for human review holds its
 place; subsequent children remain untouched. Retry a failed child explicitly
 by moving that child to To Do. Pause a parent by moving it to Backlog; this
 prevents new launches, but does not cancel an already-running worker. Resume
@@ -320,6 +351,7 @@ change is deployed.
 main.go        process lifecycle: logging, timeouts, shutdown
 server.go      routes, metrics middleware, the bounded signed read
 dispatch.go    the column table, label lookup, wake, busy probe, launch
+queue.go       priority/FIFO ordering and durable stage admission
 launch.sh      detached launch and worker acceptance handshake
 http.go        authenticated JSON requests and response validation
 reconcile.go   the sweep, and the GitHub questions it asks

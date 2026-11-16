@@ -59,6 +59,7 @@ func newObservationFSM(initial string) *fsm.FSM {
 
 func newCommandFSM(initial string) *fsm.FSM {
 	return fsm.NewFSM(initial, fsm.Events{
+		{Name: "launch-rejected", Src: []string{"issued"}, Dst: "finished"},
 		{Name: "start", Src: []string{"issued"}, Dst: "starting"},
 		{Name: "started", Src: []string{"starting"}, Dst: "running"},
 		{Name: "report", Src: []string{"running"}, Dst: "reporting"},

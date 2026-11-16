@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"net/url"
 	"path"
@@ -114,6 +113,29 @@ func (d *dispatcher) issueCommand(ctx context.Context, id, repo, column string, 
 		return nil, err
 	}
 	return command, nil
+}
+
+func (d *dispatcher) rejectLaunch(ctx context.Context, id, commandID string) error {
+	cm, err := d.commandStore(ctx)
+	if err != nil {
+		return err
+	}
+	command, err := readCommand(cm, id)
+	if err != nil {
+		return err
+	}
+	if command == nil || command.ID != commandID || command.Phase != "issued" {
+		return nil
+	}
+	command.Phase, err = fsmEvent(ctx, newCommandFSM(command.Phase), "launch-rejected")
+	if err != nil {
+		return err
+	}
+	command.Outcome = "launch-rejected"
+	if command.Prompt != nil {
+		command.Prompt.Payload = ""
+	}
+	return d.saveCommandRecord(ctx, cm, id, command)
 }
 
 // A move is prepared from fresh board facts before its one-shot intent is
@@ -244,16 +266,7 @@ func (d *dispatcher) workerEvent(w http.ResponseWriter, r *http.Request) {
 	if strings.HasSuffix(report.Event, "-succeeded") || strings.HasSuffix(report.Event, "-failed") || report.Event == "merge-reverted" {
 		// A status webhook may have arrived while the command was reporting.
 		// Once its acknowledgment is durable, explicitly deliver the handoff.
-		d.detach(r, func(ctx context.Context) {
-			task, err := d.workflowTask(ctx, report.Task)
-			if err != nil {
-				slog.Error("read handoff", "task", report.Task, "err", err)
-				return
-			}
-			if st, ok := routes[task.Status]; ok {
-				d.dispatch(ctx, task.Status, st, card{ID: report.Task})
-			}
-		})
+		d.detach(r, func(ctx context.Context) { d.runSweep(ctx, false) })
 	}
 }
 
@@ -566,6 +579,11 @@ func (d *dispatcher) saveCommandRecord(ctx context.Context, cm *corev1.ConfigMap
 	}
 	original := cm
 	for attempt := 0; attempt < 5; attempt++ {
+		if command, ok := value.(*workerCommand); ok && command.Phase == "issued" {
+			if err := d.stageAvailable(cm, key, command.Stage); err != nil {
+				return err
+			}
+		}
 		encoded, err := json.Marshal(value)
 		if err != nil {
 			return err
