@@ -38,7 +38,7 @@ func requestJSON(ctx context.Context, client *http.Client, method, u, bearer str
 	}
 	defer res.Body.Close()
 	if res.StatusCode/100 != 2 {
-		return fmt.Errorf("%s %s: unexpected status %d", method, req.URL.Path, res.StatusCode)
+		return &httpStatusError{Method: method, Path: req.URL.Path, Code: res.StatusCode}
 	}
 	const maxResponse = 8 << 20
 	raw, err := io.ReadAll(io.LimitReader(res.Body, maxResponse+1))
@@ -75,4 +75,13 @@ func requestJSON(ctx context.Context, client *http.Client, method, u, bearer str
 		return fmt.Errorf("%s: expected one JSON value", req.URL.Path)
 	}
 	return nil
+}
+
+type httpStatusError struct {
+	Method, Path string
+	Code         int
+}
+
+func (e *httpStatusError) Error() string {
+	return fmt.Sprintf("%s %s: unexpected status %d", e.Method, e.Path, e.Code)
 }

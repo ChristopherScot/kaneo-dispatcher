@@ -25,7 +25,7 @@ func TestLaunchRequiresWorkerAcceptance(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			script := filepath.Join(t.TempDir(), "stage")
 			if tc.script != "" {
-				if err := os.WriteFile(script, []byte("#!/bin/sh\n# dispatcher-command-protocol: 1\nset -eu\n"+tc.script+"\n"), 0700); err != nil {
+				if err := os.WriteFile(script, []byte("#!/bin/sh\n# dispatcher-command-protocol: 2\nset -eu\n"+tc.script+"\n"), 0700); err != nil {
 					t.Fatal(err)
 				}
 			}

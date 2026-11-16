@@ -211,6 +211,24 @@ func (s *stubGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch {
+	case strings.Contains(r.URL.Path, "/git/ref/heads/"):
+		ref := strings.SplitN(r.URL.Path, "/git/ref/heads/", 2)[1]
+		if ref == "main" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"ref": "refs/heads/" + ref, "object": map[string]string{"type": "commit", "sha": "base-sha"}})
+			return
+		}
+		for _, list := range s.prs {
+			for _, pr := range list {
+				head, _ := pr["head"].(map[string]any)
+				if head["ref"] == ref {
+					_ = json.NewEncoder(w).Encode(map[string]any{"ref": "refs/heads/" + ref, "object": map[string]any{"type": "commit", "sha": head["sha"]}})
+					return
+				}
+			}
+		}
+		http.NotFound(w, r)
+	case strings.Contains(r.URL.Path, "/compare/"):
+		_ = json.NewEncoder(w).Encode(map[string]int{"ahead_by": 1})
 	case strings.HasPrefix(r.URL.Path, "/repos/") && !strings.HasSuffix(r.URL.Path, "/pulls"):
 		_ = json.NewEncoder(w).Encode(map[string]string{"default_branch": "main"})
 	case strings.HasSuffix(r.URL.Path, "/pulls"):

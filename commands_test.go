@@ -33,7 +33,7 @@ func commandFor(t *testing.T, f *fixture, column string) *workerCommand {
 
 func reportTo(t *testing.T, f *fixture, command *workerCommand, event string) int {
 	t.Helper()
-	raw, err := json.Marshal(workerReport{Task: "t1", Command: command.ID, Event: event})
+	raw, err := json.Marshal(workerReport{Task: "t1", Command: command.ID, PromptDigest: command.Prompt.Digest, Event: event})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,6 +79,7 @@ func TestCommandLifecycleAndStaleReports(t *testing.T) {
 	if got := reportTo(t, f, command, "test-succeeded"); got != 409 {
 		t.Fatalf("wrong stage: %d", got)
 	}
+	f.github.prs["TestOwner:fix/t1"] = openPR("abc")
 	if got := reportTo(t, f, command, "author-succeeded"); got != 200 {
 		t.Fatalf("outcome: %d", got)
 	}
@@ -224,7 +225,7 @@ func TestRevertIntentSurvivesLostOutcome(t *testing.T) {
 	pr := openPR("abc")[0]
 	pr["base"] = map[string]any{"ref": "main", "repo": map[string]string{"full_name": "TestOwner/testrepo"}}
 	f.github.prs["TestOwner:fix/t1"] = []map[string]any{pr}
-	report := workerReport{Task: "t1", Command: command.ID, Event: "merge-authorize", PR: 1, SHA: "abc"}
+	report := workerReport{Task: "t1", Command: command.ID, PromptDigest: command.Prompt.Digest, Event: "merge-authorize", PR: 1, SHA: "abc"}
 	if err := f.d.acceptReport(t.Context(), report); err != nil {
 		t.Fatal(err)
 	}
@@ -283,7 +284,7 @@ func TestStartAcknowledgmentRace(t *testing.T) {
 				}
 				return nil
 			}}
-			err := f.d.acceptReport(t.Context(), workerReport{Task: "t1", Command: command.ID, Event: "test-started"})
+			err := f.d.acceptReport(t.Context(), workerReport{Task: "t1", Command: command.ID, PromptDigest: command.Prompt.Digest, Event: "test-started"})
 			if !injected {
 				t.Fatal("race was not exercised")
 			}

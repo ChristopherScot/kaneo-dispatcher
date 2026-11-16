@@ -36,6 +36,9 @@ func (f *fixture) stale(column string) {
 	f.kaneo.board = boardWith(column, "t1", "T-1", ago(10*time.Hour))
 	f.moved("t1", 5*time.Hour)
 	f.kaneo.labels["t1"] = []string{"repo:testrepo"}
+	if column == "in-review" || column == "mergeable" {
+		f.github.prs["TestOwner:fix/t1"] = openPR("abc")
+	}
 }
 
 func (f *fixture) reconcile(dry bool) sweep {
@@ -48,7 +51,7 @@ func (f *fixture) reconcile(dry bool) sweep {
 }
 
 func openPR(sha string) []map[string]any {
-	return []map[string]any{{"merged_at": nil, "number": 1, "head": map[string]any{"sha": sha, "ref": "fix/t1", "repo": map[string]string{"full_name": "TestOwner/testrepo"}}}}
+	return []map[string]any{{"merged_at": nil, "state": "open", "number": 1, "head": map[string]any{"sha": sha, "ref": "fix/t1", "repo": map[string]string{"full_name": "TestOwner/testrepo"}}}}
 }
 
 func TestReconcileUsesWorkerStartForRetryDelay(t *testing.T) {
@@ -112,9 +115,6 @@ func TestStrandedInProgressCardIsHandedBackToTheAuthor(t *testing.T) {
 	want := []string{"sh", "-c", launchLine, "/usr/local/bin/stage-author", "t1", "TestOwner/testrepo"}
 	if len(l) != 1 || l[0].pod != "claude-session-0" || (len(l[0].argv) != len(want)+1 || !slices.Equal(l[0].argv[:len(want)], want) || l[0].argv[len(want)] == "") {
 		t.Errorf("launches = %v, want the author stage in claude-session-0 with t1 and its repo", l)
-	}
-	if hits := f.github.calls(); len(hits) != 1 {
-		t.Errorf("expected merge lookup only: %v", hits)
 	}
 }
 

@@ -2,7 +2,7 @@
 # Success means the worker sourced its preamble and acquired its pod lock.
 set -eu
 [ -x "$0" ] || { echo "stage is not executable" >&2; exit 1; }
-grep -qx '# dispatcher-command-protocol: 1' "$0" || { echo "worker does not support dispatcher commands" >&2; exit 1; }
+grep -qx '# dispatcher-command-protocol: 2' "$0" || { echo "worker does not support dispatcher commands" >&2; exit 1; }
 command -v setsid >/dev/null
 command -v nohup >/dev/null
 dir=$(mktemp -d /tmp/kaneo-launch.XXXXXX)

@@ -22,17 +22,18 @@ import (
 const commandMap = "kaneo-commands"
 
 type workerCommand struct {
-	MergePR   int       `json:"mergePR,omitempty"`
-	MergeSHA  string    `json:"mergeSHA,omitempty"`
-	ID        string    `json:"id"`
-	Repo      string    `json:"repo"`
-	Stage     string    `json:"stage"`
-	Phase     string    `json:"phase"`
-	Column    string    `json:"column"`
-	Visit     time.Time `json:"visit"`
-	IssuedAt  time.Time `json:"issuedAt"`
-	StartedAt time.Time `json:"startedAt"`
-	Outcome   string    `json:"outcome,omitempty"`
+	Prompt    *commandPrompt `json:"prompt,omitempty"`
+	MergePR   int            `json:"mergePR,omitempty"`
+	MergeSHA  string         `json:"mergeSHA,omitempty"`
+	ID        string         `json:"id"`
+	Repo      string         `json:"repo"`
+	Stage     string         `json:"stage"`
+	Phase     string         `json:"phase"`
+	Column    string         `json:"column"`
+	Visit     time.Time      `json:"visit"`
+	IssuedAt  time.Time      `json:"issuedAt"`
+	StartedAt time.Time      `json:"startedAt"`
+	Outcome   string         `json:"outcome,omitempty"`
 }
 
 func (d *dispatcher) commandStore(ctx context.Context) (*corev1.ConfigMap, error) {
@@ -91,6 +92,22 @@ func (d *dispatcher) issueCommand(ctx context.Context, id, repo, column string, 
 		}
 	}
 	command := &workerCommand{ID: rand.Text(), Repo: repo, Stage: strings.TrimPrefix(path.Base(st.script), "stage-"), Phase: "issued", Column: column, Visit: work.enteredAt, IssuedAt: time.Now().UTC()}
+	command.Prompt, err = d.snapshotPrompt(ctx, id, repo, command.Stage)
+	if err != nil {
+		return nil, err
+	}
+	// Snapshot reads may be slow. A changed visit must not inherit this plan.
+	task, err := d.workflowTask(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	latest, err := d.taskWork(ctx, id, st)
+	if err != nil {
+		return nil, err
+	}
+	if task.Status != column || !latest.enteredAt.Equal(work.enteredAt) {
+		return nil, errCardChanged
+	}
 	if err := d.saveCommandRecord(ctx, cm, id, command); err != nil {
 		return nil, err
 	}
@@ -150,20 +167,20 @@ func (d *dispatcher) moveTicket(ctx context.Context, id, column, event string, e
 }
 
 type workerReport struct {
-	Message  string `json:"message,omitempty"`
-	URL      string `json:"url,omitempty"`
-	Title    string `json:"title,omitempty"`
-	PR       int    `json:"pr,omitempty"`
-	SHA      string `json:"sha,omitempty"`
-	Task     string `json:"task"`
-	Command  string `json:"command"`
-	Event    string `json:"event"`
-	RevertPR int    `json:"revertPR,omitempty"`
+	PromptDigest string `json:"promptDigest,omitempty"`
+	Message      string `json:"message,omitempty"`
+	URL          string `json:"url,omitempty"`
+	Title        string `json:"title,omitempty"`
+	PR           int    `json:"pr,omitempty"`
+	SHA          string `json:"sha,omitempty"`
+	Task         string `json:"task"`
+	Command      string `json:"command"`
+	Event        string `json:"event"`
+	RevertPR     int    `json:"revertPR,omitempty"`
 }
 
 func (d *dispatcher) workerEvent(w http.ResponseWriter, r *http.Request) {
-	if d.apiKey == "" || subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+d.apiKey)) != 1 {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	if !d.authorizedWorker(w, r) {
 		return
 	}
 	var report workerReport
@@ -265,6 +282,9 @@ func (d *dispatcher) acceptReport(ctx context.Context, report workerReport) erro
 	starting := report.Event == command.Stage+"-started"
 	action := "report"
 	if starting {
+		if err := d.validatePromptStart(ctx, command, report.PromptDigest); err != nil {
+			return err
+		}
 		action = "start"
 	}
 
@@ -329,6 +349,9 @@ func (d *dispatcher) acceptReport(ctx context.Context, report workerReport) erro
 		command.StartedAt = time.Now().UTC()
 	} else {
 		command.Outcome = report.Event
+		if command.Prompt != nil {
+			command.Prompt.Payload = ""
+		}
 	}
 	command.Phase, err = fsmEvent(ctx, newCommandFSM(phase), action)
 	if err != nil {
@@ -451,8 +474,27 @@ func (d *dispatcher) saveCommandRecord(ctx context.Context, cm *corev1.ConfigMap
 	}
 	original := cm
 	for attempt := 0; attempt < 5; attempt++ {
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return err
+		}
+		size := len(key) + len(encoded)
+		priorSize := 0
+		for existing, raw := range cm.Data {
+			priorSize += len(existing) + len(raw)
+			if existing != key {
+				size += len(existing) + len(raw)
+			}
+		}
+		limit := commandMetadataBudget
+		if command, ok := value.(*workerCommand); ok && command.Phase == "issued" && command.Prompt != nil && command.Prompt.Payload != "" {
+			limit = commandStoreBudget
+		}
+		if size > limit && size >= priorSize {
+			return blocked("command store exceeds safe budget; archive finished records")
+		}
 		copy := cm.DeepCopy()
-		err := saveState(ctx, d.workflows, copy, key, value)
+		err = saveState(ctx, d.workflows, copy, key, value)
 		if err == nil {
 			*original = *copy
 			return nil
@@ -484,4 +526,12 @@ func (d *dispatcher) mergeVerified(ctx context.Context, id string, pr int) (bool
 		return false, err
 	}
 	return command == nil || command.MergePR != pr || command.Outcome == "merge-succeeded", nil
+}
+
+func (d *dispatcher) authorizedWorker(w http.ResponseWriter, r *http.Request) bool {
+	if d.apiKey == "" || subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+d.apiKey)) != 1 {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return false
+	}
+	return true
 }
