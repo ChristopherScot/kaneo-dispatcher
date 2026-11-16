@@ -93,7 +93,7 @@ func TestUnparseableBodyIsAcceptedAndLogged(t *testing.T) {
 func TestDispatchingColumnLaunchesTheStageInItsPod(t *testing.T) {
 	f := newFixture(t)
 	f.kaneo.labels["t2"] = []string{"bug", "repo:testrepo"}
-	if w := f.signed("/", move("t2", "to-do")); w.Code != http.StatusAccepted {
+	if w := f.signed("/", `{"event":"task.status_changed","task":{"id":"t2","ticketId":"CLA-22"},"data":{"newStatus":"to-do"}}`); w.Code != http.StatusAccepted {
 		t.Fatalf("got %d, want 202", w.Code)
 	}
 	l := f.pods.launches()
@@ -110,8 +110,8 @@ func TestDispatchingColumnLaunchesTheStageInItsPod(t *testing.T) {
 	if len(l[0].argv) != len(want)+1 || !slices.Equal(l[0].argv[:len(want)], want) || l[0].argv[len(want)] == "" {
 		t.Errorf("argv = %q, want %q", l[0].argv, want)
 	}
-	f.wantLog("msg=start task=t2 repo=TestOwner/testrepo pod=claude-session-0 script=stage-author")
-	f.wantLog("msg=launched task=t2 repo=TestOwner/testrepo rc=0")
+	f.wantLog("msg=start task=CLA-22 repo=TestOwner/testrepo pod=claude-session-0 script=stage-author")
+	f.wantLog("msg=launched task=CLA-22 repo=TestOwner/testrepo rc=0")
 }
 
 // The set sleeps at 0 replicas when idle, so the busy probe would fail
