@@ -13,54 +13,23 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/ChristopherScot/kaneo-dispatcher/internal/protocol"
 )
 
 //go:embed prompts/*.md
 var promptTemplates embed.FS
 
+const reworkHeadline = "Sent back for rework"
+
 const maxPromptBytes = 64 << 10
 const commandStoreBudget = 768 << 10     // new snapshots
 const commandMetadataBudget = 1000 << 10 // progress can use reserved headroom
 
-// Payload is a JSON string so its exact hashed bytes survive HTTP/JSON and
-// ConfigMap round trips. Never hash a client's reserialization of this JSON.
-type commandPrompt struct {
-	Template       string `json:"template"`
-	TemplateDigest string `json:"templateDigest"`
-	Digest         string `json:"digest"`
-	Payload        string `json:"payload,omitempty"`
-}
-
-type promptTask struct {
-	ID          string          `json:"id"`
-	Project     string          `json:"projectId"`
-	Title       string          `json:"title"`
-	Description json.RawMessage `json:"description"`
-}
-type promptComment struct {
-	Type      string `json:"type"`
-	Content   string `json:"content"`
-	CreatedAt string `json:"createdAt"`
-}
-
-type promptPayload struct {
-	Version        int             `json:"version"`
-	Task           promptTask      `json:"task"`
-	Repo           string          `json:"repo"`
-	Stage          string          `json:"stage"`
-	Mode           string          `json:"mode"`
-	Branch         string          `json:"branch"`
-	Base           string          `json:"base"`
-	BaseSHA        string          `json:"baseSHA"`
-	BranchSHA      string          `json:"branchSHA"`
-	PR             int             `json:"pr"`
-	HeadSHA        string          `json:"headSHA"`
-	Reworks        int             `json:"reworks"`
-	TimeoutSeconds int             `json:"timeoutSeconds"`
-	Result         string          `json:"result"`
-	Instructions   string          `json:"instructions"`
-	Comments       []promptComment `json:"comments"`
-}
+type commandPrompt = protocol.Prompt
+type promptTask = protocol.Task
+type promptComment = protocol.Comment
+type promptPayload = protocol.Payload
 
 func digest(text string) string {
 	sum := sha256.Sum256([]byte(text))
@@ -87,7 +56,7 @@ func (d *dispatcher) snapshotPrompt(ctx context.Context, id, repo, stage string)
 	for _, activity := range activities {
 		if activity.Type == "comment" {
 			payload.Comments = append(payload.Comments, activity)
-			if strings.HasPrefix(activity.Content, "Sent back for rework") {
+			if strings.HasPrefix(activity.Content, reworkHeadline) {
 				payload.Reworks++
 			}
 		}
@@ -218,11 +187,7 @@ func (d *dispatcher) workerPrompt(w http.ResponseWriter, r *http.Request) {
 	if !d.authorizedWorker(w, r) {
 		return
 	}
-	var request struct {
-		Task    string `json:"task"`
-		Command string `json:"command"`
-		Version int    `json:"version"`
-	}
+	var request protocol.Request
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&request); err != nil || request.Version != 1 || request.Task == "" || request.Command == "" {
@@ -247,7 +212,7 @@ func (d *dispatcher) workerPrompt(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
-	_ = json.NewEncoder(w).Encode(map[string]any{"version": 1, "task": request.Task, "command": command.ID, "repo": command.Repo, "stage": command.Stage, "prompt": command.Prompt})
+	_ = json.NewEncoder(w).Encode(protocol.Command{Version: protocol.Version, Task: request.Task, Command: command.ID, Repo: command.Repo, Stage: command.Stage, Prompt: *command.Prompt})
 }
 
 func (d *dispatcher) validatePromptStart(ctx context.Context, command *workerCommand, suppliedDigest string) error {

@@ -5,16 +5,17 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"net/http"
 	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 )
 
 func commandFor(t *testing.T, f *fixture, column string) *workerCommand {
@@ -295,5 +296,32 @@ func TestStartAcknowledgmentRace(t *testing.T) {
 				t.Fatalf("metadata conflict stranded start: %v", err)
 			}
 		})
+	}
+}
+
+// Historical rework receipts still count after workers stop owning their wording.
+func TestStructuredReworkReceipt(t *testing.T) {
+	var content string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/comment/t1" {
+			t.Errorf("path %s", r.URL.Path)
+		}
+		var body struct{ Content string }
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+		}
+		content = body.Content
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+	d := dispatcher{kaneoURL: server.URL, client: server.Client()}
+	if err := d.workerArtifact(t.Context(), workerReport{Task: "t1", Event: "note", NoteKind: "rework", Message: "fix the failing check"}); err != nil {
+		t.Fatal(err)
+	}
+	if content != "Sent back for rework: fix the failing check" {
+		t.Fatalf("historical rework format changed: %q", content)
+	}
+	if err := d.workerArtifact(t.Context(), workerReport{Task: "t1", Event: "note", NoteKind: "unknown", Message: "not a receipt"}); err == nil {
+		t.Fatal("unknown note kind accepted")
 	}
 }

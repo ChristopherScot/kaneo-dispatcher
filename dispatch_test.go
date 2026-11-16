@@ -7,11 +7,12 @@ import (
 	"maps"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ChristopherScot/kaneo-dispatcher/internal/worker"
 )
 
 func TestUnsignedPostIsRefused(t *testing.T) {
@@ -195,19 +196,11 @@ func TestBusyProbeRunsInTheStagePodBeforeTheLaunch(t *testing.T) {
 	}
 }
 
-// The probe must lock the file the scripts lock, override included. Read
-// from the script itself, so a change there fails here.
-func TestBusyProbeLocksWhatTheScriptsLock(t *testing.T) {
-	src, err := os.ReadFile(homelabPath(t, "claude-pods/lib/pod-common.sh"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	const lockExpr = `"${NIGHTLY_LOCK:-/tmp/nightly.lock}"`
-	if !strings.Contains(string(src), lockExpr) {
-		t.Fatalf("pod-common.sh no longer locks %s; busyProbe must change with it", lockExpr)
-	}
+// The remote probe and the Go worker must share the lock, override included.
+func TestBusyProbeLocksWhatTheWorkerLocks(t *testing.T) {
+	lockExpr := `"${NIGHTLY_LOCK:-` + worker.DefaultLock + `}"`
 	if !strings.Contains(busyProbe, lockExpr) {
-		t.Errorf("busyProbe = %q does not lock %s", busyProbe, lockExpr)
+		t.Fatalf("busyProbe = %q does not lock %s", busyProbe, lockExpr)
 	}
 }
 
