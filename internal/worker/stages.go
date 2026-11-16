@@ -181,8 +181,8 @@ func (r *runner) comment(ctx context.Context, body string) error {
 }
 
 func (r *runner) block(ctx context.Context, reason string) error {
-	if err := r.note(ctx, "@"+r.cfg.Owner+" "+reason); err != nil {
-		return err
-	}
-	return r.outcome(ctx, "blocked")
+	// A failed explanatory comment must not leave an exited worker marked
+	// running. Attempt the terminal report independently, retaining both errors.
+	noteErr := r.note(ctx, "@"+r.cfg.Owner+" "+reason)
+	return errors.Join(noteErr, r.outcome(ctx, "blocked"))
 }
