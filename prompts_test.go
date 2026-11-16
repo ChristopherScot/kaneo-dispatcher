@@ -59,7 +59,7 @@ func TestDispatcherSelectsAuthorModeAndBoundsSnapshots(t *testing.T) {
 		name, state, mode string
 		reworks           int
 	}{
-		{"fresh", "", "author", 0}, {"existing unreviewed", "open", "advance", 0},
+		{"fresh", "", "author", 0}, {"existing unfinished PR", "open", "resume", 0},
 		{"rework", "open", "rework", 1}, {"capped", "open", "blocked", 2},
 		{"resume remote commits", "closed", "resume", 0},
 	} {

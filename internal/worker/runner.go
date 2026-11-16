@@ -90,7 +90,12 @@ func Run(ctx context.Context, cfg Config) error {
 	r := runner{cfg: cfg, lock: lock, http: &http.Client{Timeout: 95 * time.Second}, key: key, ghToken: gh,
 		dir: filepath.Join(cfg.Workspace, filepath.Base(cfg.Repo)), archive: filepath.Join(cfg.StateDir, "commands", cfg.Command), log: log.New(io.MultiWriter(writers...), "", log.LstdFlags)}
 	r.maintenance("warn")
-	defer r.maintenance("prune")
+	defer func() {
+		// Shutdown time belongs to publishing work, not cache maintenance.
+		if ctx.Err() == nil {
+			r.maintenance("prune")
+		}
+	}()
 	err = r.execute(ctx)
 	if err != nil {
 		r.log.Print(r.redact(err.Error()))
@@ -127,8 +132,6 @@ func (r *runner) execute(ctx context.Context) error {
 		return err
 	}
 	switch r.payload.Mode {
-	case "advance":
-		return r.outcome(ctx, "succeeded")
 	case "blocked":
 		if err := r.note(ctx, "the review panel rework limit has been reached"); err != nil {
 			return err

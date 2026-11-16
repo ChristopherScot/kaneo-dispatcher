@@ -2,11 +2,10 @@ You are resuming work on Kaneo card {{task}} in {{workspace}}, a clone of {{repo
 Non-interactive: nobody can answer questions, so make reasonable decisions
 and record them in the PR body.
 
-A previous run committed {{resume_ahead}} change(s) to the branch
-{{branch}} and stopped before opening a pull request. It
-was not interrupted because anything was wrong — a usage limit, a
-timeout, or a node going away all end a run mid-flight. The branch is
-already checked out.
+A previous run left work on branch {{branch}}, which is already checked out.
+The run may have stopped before or after opening a pull request. Commits whose
+messages begin with `stash:` are unfinished checkpoints, not evidence that the
+work passed review or testing.
 
 1. Find out what was already done before changing anything:
      git log --oneline origin/HEAD..HEAD
@@ -36,7 +35,8 @@ already checked out.
    This is what makes the next interruption cheap. The branch already
    exists upstream, so a plain push is enough.
 
-7. Open the pull request with gh pr create, linking the card:
+7. Update the existing pull request for this branch, or open one with
+   gh pr create if none exists. Link the card:
      Kaneo: {{board_url}}/dashboard/task/{{task}}
    Say in the body that the change was produced across more than one run,
    and what each contributed. A reviewer reading a 3,000-line diff is

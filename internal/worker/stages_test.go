@@ -63,7 +63,12 @@ func stageTool(t *testing.T, r *runner, name, body string) {
 
 func TestAuthorReportsReasonBeforeNoPROutcome(t *testing.T) {
 	r, reports := stageFixture(t, "author", `printf '%s' '{"type":"result","is_error":false,"result":"OBSOLETE: the code already implements this"}'`, nil)
-	stageTool(t, r, "git", "[ \"$1\" = rev-list ]\nprintf 0")
+	stageTool(t, r, "git", `case "$1" in
+ symbolic-ref) printf refs/heads/fix/t1 ;;
+ status) ;;
+ rev-list) printf 0 ;;
+ *) exit 1 ;;
+esac`)
 	stageTool(t, r, "gh", "printf '[]'")
 	if err := r.author(t.Context()); err != nil {
 		t.Fatal(err)

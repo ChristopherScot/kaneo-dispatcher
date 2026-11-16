@@ -96,14 +96,15 @@ func (d *dispatcher) snapshotPrompt(ctx context.Context, id, repo, stage string)
 		}
 	}
 	mode := stage
-	ahead := 0
 	switch stage {
 	case "author":
 		payload.TimeoutSeconds, payload.Result = 3600, "author-v1"
 		if payload.PR > 0 {
 			switch {
 			case payload.Reworks == 0:
-				mode = "advance"
+				// An open PR can contain unfinished work. Only an author
+				// execution may report completion; PR existence cannot.
+				mode = "resume"
 			case payload.Reworks >= 2:
 				mode = "blocked"
 			default:
@@ -119,8 +120,7 @@ func (d *dispatcher) snapshotPrompt(ctx context.Context, id, repo, stage string)
 			if comparison.Ahead == nil || *comparison.Ahead < 0 {
 				return nil, fmt.Errorf("invalid branch comparison")
 			}
-			ahead = *comparison.Ahead
-			if ahead > 0 {
+			if *comparison.Ahead > 0 {
 				mode = "resume"
 			}
 		}
@@ -139,7 +139,7 @@ func (d *dispatcher) snapshotPrompt(ctx context.Context, id, repo, stage string)
 	}
 	payload.Mode = mode
 	instructions := "Do not invoke Claude for this command. Report the dispatcher-selected author outcome."
-	if mode != "advance" && mode != "blocked" {
+	if mode != "blocked" {
 		raw, err := promptTemplates.ReadFile("prompts/" + mode + ".md")
 		if err != nil {
 			return nil, err
@@ -151,7 +151,7 @@ func (d *dispatcher) snapshotPrompt(ctx context.Context, id, repo, stage string)
 	// worker as JSON data and is never passed through a template engine.
 	payload.Instructions = strings.NewReplacer(
 		"{{task}}", id, "{{repo}}", repo, "{{branch}}", payload.Branch,
-		"{{head_sha}}", payload.HeadSHA, "{{pr}}", fmt.Sprint(payload.PR), "{{resume_ahead}}", fmt.Sprint(ahead),
+		"{{head_sha}}", payload.HeadSHA, "{{pr}}", fmt.Sprint(payload.PR),
 		"{{board_url}}", envOr("KANEO_WEB_URL", "https://kaneo.home.chrisscotmartin.com"),
 	).Replace(instructions)
 	raw, err := json.Marshal(payload)

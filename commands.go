@@ -329,6 +329,24 @@ func (d *dispatcher) acceptReportAttempt(ctx context.Context, report workerRepor
 			return err
 		}
 	}
+	// An author event must come from an execution contract, never an
+	// inference that a branch or PR means the work is already complete.
+	// Check completion too: an older shortcut may already be running.
+	if report.Event == "author-started" || report.Event == "author-succeeded" {
+		var payload promptPayload
+		if command.Prompt == nil || json.Unmarshal([]byte(command.Prompt.Payload), &payload) != nil || payload.Stage != "author" || payload.Mode != command.Prompt.Template {
+			return blocked("missing or invalid author execution contract")
+		}
+		switch payload.Mode {
+		case "author", "resume", "rework":
+		case "blocked":
+			if report.Event == "author-succeeded" {
+				return blocked("blocked author command cannot report success")
+			}
+		default:
+			return blocked("author command requires execution; await a replacement command")
+		}
+	}
 	target, err := fsmEvent(ctx, newTicketFSM(task.Status), report.Event)
 	if err != nil {
 		return err
