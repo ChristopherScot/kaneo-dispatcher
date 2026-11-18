@@ -170,6 +170,16 @@ prompt. Output and credential-redacted attempt records are bounded and archived.
 A nonzero exit or error result cannot produce a passing test/review verdict.
 Test verdict files live in the command archive, outside the repository.
 
+A cancelled author or test run (SIGTERM from the pod's preStop hook) still
+finishes inside a bounded budget: the author commits dirty work as a `stash:`
+checkpoint and pushes it, the test stage resets its scratch, and both report
+blocked with the interruption reason rather than exiting silently. The author's
+note names the pushed branch and SHA; moving the card back to To Do resumes
+from GitHub. A failed push is reported as such and the local checkout is kept.
+A cancelled merge review reports nothing: the running command holds its slot
+until the stale timeout and is then reissued, and a merge already authorized
+stays held for explicit recovery.
+
 Merge authorization precedes a durable intent, then the exact-head GitHub merge
 request. The confirmed merge SHA is archived before any completion report.
 Post-merge verification queries that commit, and uncertain writes are never

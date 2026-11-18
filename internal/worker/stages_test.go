@@ -1,7 +1,9 @@
 package worker
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/ChristopherScot/kaneo-dispatcher/internal/protocol"
 )
@@ -98,6 +101,31 @@ exit 2`, nil)
 	got := reports()
 	if len(got) != 2 || got[0].Event != "note" || got[1].Event != "test-blocked" {
 		t.Fatalf("abnormal outcome: %+v", got)
+	}
+	raw, err := os.ReadFile(filepath.Join(r.dir, "tools.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := string(raw)
+	if !strings.Contains(log, "state=error") || strings.Contains(log, "state=success") || !strings.Contains(log, "git clean -qfd") {
+		t.Fatalf("incorrect status or missing cleanup: %s", log)
+	}
+}
+
+func TestCancelledTestCleansUpAndReportsBlocked(t *testing.T) {
+	r, reports := stageFixture(t, "test", `touch scratch; sleep 5`, nil)
+	stageTool(t, r, "git", `if [ "$1" = rev-parse ]; then printf head; fi`)
+	stageTool(t, r, "gh", `printf '{}'`)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	time.AfterFunc(200*time.Millisecond, cancel)
+	err := r.test(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancellation lost: %v", err)
+	}
+	got := reports()
+	if len(got) != 2 || got[0].Event != "note" || got[1].Event != "test-blocked" || !strings.Contains(got[0].Message, context.Canceled.Error()) {
+		t.Fatalf("interrupted test outcome: %+v", got)
 	}
 	raw, err := os.ReadFile(filepath.Join(r.dir, "tools.log"))
 	if err != nil {

@@ -102,6 +102,8 @@ func TestAuthorCheckpointsUnfinishedWork(t *testing.T) {
 				}
 			} else if remoteHead != localHead {
 				t.Fatal("checkpoint not pushed")
+			} else if !strings.Contains(got[0].Message, r.payload.Branch+" at "+remoteHead) {
+				t.Fatalf("pushed checkpoint not reported: %q", got[0].Message)
 			}
 		})
 	}

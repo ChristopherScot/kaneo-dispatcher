@@ -20,21 +20,20 @@ func (r *runner) author(ctx context.Context) error {
 	// Claude and its descendants have exited. Give preservation its own
 	// budget so a cancelled run can still publish its unfinished work.
 	preserveCtx, preserveCancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
-	checkpoint, preserveErr := r.preserveAuthor(preserveCtx)
+	pushed, checkpoint, preserveErr := r.preserveAuthor(preserveCtx)
 	preserveCancel()
-	if ctx.Err() != nil {
-		runErr = errors.Join(runErr, ctx.Err())
-		// Normal reporting retains its HTTP budget, including dispatcher
-		// rate-limit waits. Only shutdown must fit the pod's grace period.
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-		defer cancel()
-	}
+	ctx, cancel, runErr := interrupted(ctx, runErr, 30*time.Second)
+	defer cancel()
 	if preserveErr != nil {
 		return errors.Join(runErr, preserveErr, r.block(ctx, "Could not publish unfinished author work; the local checkout was retained: "+r.redact(preserveErr.Error())))
 	}
 	if checkpoint || runErr != nil {
-		reason := "Author execution did not complete. Recovery branch: " + r.payload.Branch + "."
+		reason := "Author execution did not complete."
+		if pushed == "" {
+			reason += " No commits were made on " + r.payload.Branch + "."
+		} else {
+			reason += " Unfinished work is on " + r.payload.Branch + " at " + pushed + "; moving the card to To Do resumes it from GitHub."
+		}
 		if checkpoint {
 			reason += " Uncommitted changes were saved in a stash: checkpoint commit."
 		}
@@ -59,44 +58,67 @@ func (r *runner) author(ctx context.Context) error {
 	return r.outcome(ctx, "succeeded")
 }
 
-// preserveAuthor checkpoints only the commanded branch. Never publish a
-// different checkout or force away work that another actor has pushed.
-func (r *runner) preserveAuthor(ctx context.Context) (bool, error) {
+// A cancelled run still owes cleanup and a terminal report, or the dispatcher
+// mistakes the exited worker for active work. Replace the cancelled context
+// with one bounded by budget, which must fit the pod's termination grace
+// period, and fold the cancellation into runErr unless Claude already
+// returned it. An uncancelled run keeps its caller's budget, including
+// dispatcher rate-limit waits.
+func interrupted(ctx context.Context, runErr error, budget time.Duration) (context.Context, context.CancelFunc, error) {
+	if ctx.Err() == nil {
+		return ctx, func() {}, runErr
+	}
+	if !errors.Is(runErr, ctx.Err()) {
+		runErr = errors.Join(runErr, ctx.Err())
+	}
+	bounded, cancel := context.WithTimeout(context.WithoutCancel(ctx), budget)
+	return bounded, cancel, runErr
+}
+
+// preserveAuthor checkpoints only the commanded branch and returns the head
+// it pushed, or "" when the branch holds nothing beyond its base. Never
+// publish a different checkout or force away work that another actor pushed.
+func (r *runner) preserveAuthor(ctx context.Context) (pushed string, checkpoint bool, err error) {
 	branch, err := r.git(ctx, "symbolic-ref", "--quiet", "HEAD")
 	if err != nil {
-		return false, err
+		return "", false, err
 	}
 	ref := "refs/heads/" + r.payload.Branch
 	if branch != ref {
-		return false, fmt.Errorf("author checkout changed to %q; checkpoint held", branch)
+		return "", false, fmt.Errorf("author checkout changed to %q; checkpoint held", branch)
 	}
 	dirty, err := r.git(ctx, "status", "--porcelain", "--untracked-files=all")
 	if err != nil {
-		return false, err
+		return "", false, err
 	}
-	checkpoint := dirty != ""
+	checkpoint = dirty != ""
 	if checkpoint {
 		if _, err := r.git(ctx, "add", "--all"); err != nil {
-			return false, err
+			return "", false, err
 		}
 		if _, err := r.git(ctx, "commit", "-m", "stash: unfinished work for "+r.cfg.Task+" ("+r.cfg.Command+")"); err != nil {
-			return false, err
+			return "", false, err
 		}
 	}
 	ahead, err := r.git(ctx, "rev-list", "--count", r.payload.BaseSHA+".."+ref)
 	if err != nil {
-		return checkpoint, err
+		return "", checkpoint, err
 	}
 	count, err := strconv.Atoi(ahead)
 	if err != nil || count < 0 {
-		return checkpoint, fmt.Errorf("invalid authored commit count %q", ahead)
+		return "", checkpoint, fmt.Errorf("invalid authored commit count %q", ahead)
 	}
-	if count > 0 {
-		if _, err := r.git(ctx, "push", "-u", "origin", ref+":"+ref); err != nil {
-			return checkpoint, fmt.Errorf("preserve authored commits: %w", err)
-		}
+	if count == 0 {
+		return "", checkpoint, nil
 	}
-	return checkpoint, nil
+	head, err := r.git(ctx, "rev-parse", ref)
+	if err != nil {
+		return "", checkpoint, err
+	}
+	if _, err := r.git(ctx, "push", "-u", "origin", ref+":"+ref); err != nil {
+		return "", checkpoint, fmt.Errorf("preserve authored commits: %w", err)
+	}
+	return head, checkpoint, nil
 }
 
 type authoredPullRequest struct {
@@ -126,6 +148,9 @@ func (r *runner) authoredPR(ctx context.Context) (authoredPullRequest, error) {
 
 func (r *runner) test(ctx context.Context) (resultErr error) {
 	text, runErr := r.claude(ctx)
+	// Scratch left by a cancelled run would hold every later checkout.
+	ctx, cancel, runErr := interrupted(ctx, runErr, 2*time.Minute)
+	defer cancel()
 	if err := r.verifyHead(ctx); err != nil {
 		return errors.Join(err, r.block(ctx, "The test checkout changed; its verdict was refused."))
 	}
@@ -174,7 +199,11 @@ func (r *runner) test(ctx context.Context) (resultErr error) {
 	case "FAIL":
 		return r.rework(ctx, "Integration testing failed on "+r.payload.HeadSHA+"; see the pull request report.")
 	default:
-		return errors.Join(runErr, r.block(ctx, "Integration testing could not complete on "+r.payload.HeadSHA+"; see the pull request report."))
+		reason := "Integration testing could not complete on " + r.payload.HeadSHA + "; see the pull request report."
+		if runErr != nil {
+			reason += "\n" + r.redact(runErr.Error())
+		}
+		return errors.Join(runErr, r.block(ctx, reason))
 	}
 }
 
