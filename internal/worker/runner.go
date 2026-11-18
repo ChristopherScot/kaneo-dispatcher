@@ -138,7 +138,11 @@ func (r *runner) execute(ctx context.Context) error {
 		}
 		return r.outcome(ctx, "blocked")
 	}
-	if err := r.checkout(ctx); err != nil {
+	setupErr := r.ensureRepository(ctx)
+	if setupErr == nil {
+		setupErr = r.checkout(ctx)
+	}
+	if err := setupErr; err != nil {
 		// Execution was accepted, but no stage work has begun. Preserve the
 		// checkout and report a setup block even if execution was cancelled;
 		// otherwise the dispatcher mistakes an exited worker for active work.

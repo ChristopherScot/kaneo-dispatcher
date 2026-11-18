@@ -222,7 +222,6 @@ func TestMergedPullRequestEndsTheStoryInAnyColumn(t *testing.T) {
 		t.Run(column, func(t *testing.T) {
 			f := newFixture(t)
 			f.stale(column)
-			f.d.repos = map[string][]string{"0": {}, "1": {}, "2": {}}
 			f.github.prs["TestOwner:fix/t1"] = []map[string]any{{"merged_at": "2026-11-01T00:00:00Z", "number": 1, "base": map[string]any{"ref": "main", "repo": map[string]string{"full_name": "TestOwner/testrepo"}}, "head": map[string]any{"sha": "abc", "ref": "fix/t1", "repo": map[string]string{"full_name": "TestOwner/testrepo"}}}}
 			f.kaneo.tasks["t1"] = map[string]any{"id": "t1", "projectId": "proj", "status": column, "title": "keep me", "dueDate": nil}
 			s := f.reconcile(false)
@@ -237,7 +236,6 @@ func TestMergedPullRequestEndsTheStoryInAnyColumn(t *testing.T) {
 func TestMergeableWithAnUnmergedPullRequestIsRedispatched(t *testing.T) {
 	f := newFixture(t)
 	f.stale("mergeable")
-	f.d.repos = nil
 	f.github.prs["TestOwner:fix/t1"] = openPR("abc")
 	if s := f.reconcile(false); len(s.redispatched) != 1 {
 		t.Errorf("sweep = %+v, want the merge stage re-run", s)
@@ -276,26 +274,24 @@ func TestGitHubFailureIsReportedNotTreatedAsNoWork(t *testing.T) {
 	f.wantNoLaunch()
 }
 
-// The owner in the label is the owner asked on GitHub, and the pod's
-// list is matched on the same name - one resolution, two readers.
-func TestOwnerQualifiedLabelIsLookedUpUnderThatOwner(t *testing.T) {
+// Outside-owner labels are skipped before GitHub access.
+func TestOutsideOwnerIsSkippedWithoutGitHubAccess(t *testing.T) {
 	f := newFixture(t)
 	f.stale("to-do")
 	f.kaneo.labels["t1"] = []string{"repo:Other/gamma"}
-	f.d.repos = map[string][]string{"0": {"Other/gamma"}}
 	f.reconcile(true)
 	hits := f.github.calls()
-	if len(hits) != 1 || !strings.Contains(hits[0], "head=Other%3Afix%2Ft1") {
-		t.Errorf("github hits = %v, want one pulls lookup under Other/gamma with that owner's head", hits)
+	if len(hits) != 0 {
+		t.Errorf("outside owner triggered GitHub calls: %v", hits)
 	}
 }
 
 func TestSkipReasonsReadTheSameAsTheWebhookLogs(t *testing.T) {
 	f := newFixture(t)
 	f.stale("to-do")
-	f.kaneo.labels["t1"] = []string{"repo:elsewhere"}
+	f.kaneo.labels["t1"] = []string{"repo:Other/elsewhere"}
 	s := f.reconcile(true)
-	want := "T-1: claude-session-0 does not work TestOwner/elsewhere"
+	want := `T-1: workflow blocked: repository "Other/elsewhere" is outside allowed owner TestOwner/*`
 	if len(s.skipped) != 1 || s.skipped[0] != want {
 		t.Errorf("skipped = %v, want [%q]", s.skipped, want)
 	}
