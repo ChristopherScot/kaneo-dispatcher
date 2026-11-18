@@ -118,14 +118,23 @@ func TestCancelledTestCleansUpAndReportsBlocked(t *testing.T) {
 	stageTool(t, r, "gh", `printf '{}'`)
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	time.AfterFunc(200*time.Millisecond, cancel)
+	go func() {
+		// Cancel once Claude has created its scratch, like a SIGTERM mid-run.
+		for ctx.Err() == nil {
+			if _, err := os.Stat(filepath.Join(r.dir, "scratch")); err == nil {
+				cancel()
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
 	err := r.test(ctx)
 	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("cancellation lost: %v", err)
+		t.Fatalf("test(cancelled) = %v, want context.Canceled", err)
 	}
 	got := reports()
 	if len(got) != 2 || got[0].Event != "note" || got[1].Event != "test-blocked" || !strings.Contains(got[0].Message, context.Canceled.Error()) {
-		t.Fatalf("interrupted test outcome: %+v", got)
+		t.Fatalf("test(cancelled) reports = %+v, want [note mentioning %q, test-blocked]", got, context.Canceled)
 	}
 	raw, err := os.ReadFile(filepath.Join(r.dir, "tools.log"))
 	if err != nil {
@@ -133,7 +142,7 @@ func TestCancelledTestCleansUpAndReportsBlocked(t *testing.T) {
 	}
 	log := string(raw)
 	if !strings.Contains(log, "state=error") || strings.Contains(log, "state=success") || !strings.Contains(log, "git clean -qfd") {
-		t.Fatalf("incorrect status or missing cleanup: %s", log)
+		t.Fatalf("tools after cancellation = %s, want state=error and git clean -qfd without state=success", log)
 	}
 }
 

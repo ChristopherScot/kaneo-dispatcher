@@ -106,7 +106,7 @@ func TestAuthorCheckpointsUnfinishedWork(t *testing.T) {
 				t.Fatal("checkpoint not pushed")
 			}
 			if !strings.Contains(got[0].Message, r.payload.Branch+" at "+remoteHead) {
-				t.Fatalf("pushed checkpoint not reported: %q", got[0].Message)
+				t.Fatalf("note = %q, want it to mention %q", got[0].Message, r.payload.Branch+" at "+remoteHead)
 			}
 		})
 	}
