@@ -11,7 +11,7 @@ import (
 )
 
 func TestAuthorCheckpointsUnfinishedWork(t *testing.T) {
-	for _, mode := range []string{"unfinished", "cancelled", "push-rejected", "wrong-branch"} {
+	for _, mode := range []string{"unfinished", "cancelled", "clean-cancelled", "push-rejected", "wrong-branch"} {
 		t.Run(mode, func(t *testing.T) {
 			r, reports := stageFixture(t, "author", `printf '%s' '{"type":"result","is_error":false,"result":"unfinished"}'`, nil)
 			for k, v := range map[string]string{"GIT_AUTHOR_NAME": "Test", "GIT_AUTHOR_EMAIL": "test@example.invalid", "GIT_COMMITTER_NAME": "Test", "GIT_COMMITTER_EMAIL": "test@example.invalid"} {
@@ -50,11 +50,13 @@ func TestAuthorCheckpointsUnfinishedWork(t *testing.T) {
 			if mode == "wrong-branch" {
 				git(local, "checkout", "-qb", "unrelated")
 			}
-			write(filepath.Join(local, "staged"), "staged work")
-			git(local, "add", "staged")
-			write(filepath.Join(local, "tracked"), "unstaged work")
-			write(filepath.Join(local, "untracked"), "new work")
-			write(filepath.Join(local, "ignored"), "ignored scratch")
+			if mode != "clean-cancelled" {
+				write(filepath.Join(local, "staged"), "staged work")
+				git(local, "add", "staged")
+				write(filepath.Join(local, "tracked"), "unstaged work")
+				write(filepath.Join(local, "untracked"), "new work")
+				write(filepath.Join(local, "ignored"), "ignored scratch")
+			}
 			if mode == "push-rejected" {
 				write(filepath.Join(remote, "hooks", "pre-receive"), "#!/bin/sh\nexit 1\n")
 			}
@@ -76,6 +78,12 @@ func TestAuthorCheckpointsUnfinishedWork(t *testing.T) {
 			}
 			localHead := git(local, "rev-parse", "HEAD")
 			remoteHead := git(remote, "rev-parse", r.payload.Branch)
+			if mode == "clean-cancelled" {
+				if localHead != r.payload.BaseSHA || remoteHead != r.payload.BaseSHA || !strings.Contains(got[0].Message, "No commits were made on "+r.payload.Branch) {
+					t.Fatalf("clean cancelled run: heads %s/%s, note %q; want base and no commits on %s", localHead, remoteHead, got[0].Message, r.payload.Branch)
+				}
+				return
+			}
 			if mode == "wrong-branch" {
 				if localHead != r.payload.BaseSHA || remoteHead != r.payload.BaseSHA || git(local, "status", "--porcelain") == "" {
 					t.Fatal("unrelated checkout modified")

@@ -22,7 +22,7 @@ func (r *runner) author(ctx context.Context) error {
 	// the shutdown report below keeps its own budget even if preservation is
 	// slow. Both run in sequence against the ceiling shutdownBudget documents.
 	preserveCtx, preserveCancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
-	pushed, checkpoint, preserveErr := r.preserveAuthor(preserveCtx)
+	pushedSHA, checkpoint, preserveErr := r.preserveAuthor(preserveCtx)
 	preserveCancel()
 	ctx, cancel, runErr := shutdownBudget(ctx, runErr, 30*time.Second)
 	defer cancel()
@@ -33,10 +33,10 @@ func (r *runner) author(ctx context.Context) error {
 		// The dispatcher selects its resume prompt from the pushed branch; the
 		// README tells the reader how to trigger that.
 		reason := "Author execution did not complete."
-		if pushed == "" {
+		if pushedSHA == "" {
 			reason += " No commits were made on " + r.payload.Branch + "."
 		} else {
-			reason += " Unfinished work is on " + r.payload.Branch + " at " + pushed + "."
+			reason += " Unfinished work is on " + r.payload.Branch + " at " + pushedSHA + "."
 			if checkpoint {
 				reason += " Uncommitted changes were saved in a stash: checkpoint commit."
 			}
@@ -64,31 +64,32 @@ func (r *runner) author(ctx context.Context) error {
 
 // shutdownBudget replaces a cancelled ctx with one bounded by budget, so the
 // cleanup and terminal report that follow a run still happen; otherwise the
-// dispatcher mistakes the exited worker for active work. The returned error
-// is runErr, or the cancellation when runErr is nil, so a run that itself
-// succeeded is never reported as success; it never reports a failure of this
-// call. An uncancelled run keeps its caller's context and budget, including
-// dispatcher rate-limit waits. Callers always call the returned cancel.
+// dispatcher mistakes the exited worker for active work. runErr passes
+// through, except that a cancelled run which itself succeeded gets the
+// cancellation, so it is never reported as success. An uncancelled run keeps
+// its caller's context and budget, including dispatcher rate-limit waits.
+// Callers always call cancel.
 //
 // The session pod's preStop hook (homelab) sends SIGTERM and waits for the
 // worker's lock inside a 180s termination grace period. Every budget a stage
 // spends after cancellation, in sequence, must fit inside it.
-func shutdownBudget(ctx context.Context, runErr error, budget time.Duration) (context.Context, context.CancelFunc, error) {
+func shutdownBudget(ctx context.Context, runErr error, budget time.Duration) (bounded context.Context, cancel context.CancelFunc, _ error) {
 	if ctx.Err() == nil {
 		return ctx, func() {}, runErr
 	}
 	if runErr == nil {
 		runErr = ctx.Err()
 	}
-	bounded, cancel := context.WithTimeout(context.WithoutCancel(ctx), budget)
+	bounded, cancel = context.WithTimeout(context.WithoutCancel(ctx), budget)
 	return bounded, cancel, runErr
 }
 
-// preserveAuthor checkpoints only the commanded branch. pushed is the head it
-// published, or "" when the branch holds nothing beyond its base; checkpoint
-// reports whether uncommitted work was first committed as a `stash:` commit.
-// Never publish a different checkout or force away work another actor pushed.
-func (r *runner) preserveAuthor(ctx context.Context) (pushed string, checkpoint bool, err error) {
+// preserveAuthor checkpoints only the commanded branch. pushedSHA is the head
+// it published, or "" when the branch holds nothing beyond its base;
+// checkpoint reports whether uncommitted work was first committed as a
+// `stash:` commit, which always leaves something to push. Never publish a
+// different checkout or force away work another actor pushed.
+func (r *runner) preserveAuthor(ctx context.Context) (pushedSHA string, checkpoint bool, err error) {
 	branch, err := r.git(ctx, "symbolic-ref", "--quiet", "HEAD")
 	if err != nil {
 		return "", false, err
@@ -119,7 +120,7 @@ func (r *runner) preserveAuthor(ctx context.Context) (pushed string, checkpoint 
 		return "", false, fmt.Errorf("invalid authored commit count %q", ahead)
 	}
 	if count == 0 {
-		return "", checkpoint, nil
+		return "", false, nil
 	}
 	head, err := r.git(ctx, "rev-parse", ref)
 	if err != nil {
@@ -180,8 +181,8 @@ func (r *runner) test(ctx context.Context) (resultErr error) {
 		}
 		resultErr = errors.Join(resultErr, err)
 	}()
-	verdict, err := readTestVerdict(filepath.Join(r.archive, "verdict.txt"))
-	if err != nil || runErr != nil {
+	verdict, verdictErr := readTestVerdict(filepath.Join(r.archive, "verdict.txt"))
+	if verdictErr != nil || runErr != nil {
 		verdict = "BLOCKED"
 	}
 	state := map[string]string{"PASS": "success", "FAIL": "failure", "BLOCKED": "error"}[verdict]
@@ -213,8 +214,10 @@ func (r *runner) test(ctx context.Context) (resultErr error) {
 		return r.rework(ctx, "Integration testing failed on "+r.payload.HeadSHA+"; see the pull request report.")
 	default:
 		reason := "Integration testing could not complete on " + r.payload.HeadSHA + "; see the pull request report."
-		if runErr != nil {
-			reason += "\n" + r.redact(runErr.Error())
+		for _, cause := range []error{runErr, verdictErr} {
+			if cause != nil {
+				reason += "\n" + r.redact(cause.Error())
+			}
 		}
 		return errors.Join(runErr, r.block(ctx, reason))
 	}
