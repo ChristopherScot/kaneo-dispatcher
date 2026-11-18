@@ -39,6 +39,8 @@ func (r *runner) merge(ctx context.Context) error {
 	}
 	text, err := r.claude(ctx)
 	if err != nil {
+		// A cancelled review deliberately reports nothing: the dispatcher
+		// reissues the merge after its stale timeout, with no human needed.
 		return err
 	}
 	if err := r.verifyHead(ctx); err != nil {

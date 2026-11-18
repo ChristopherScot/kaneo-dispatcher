@@ -17,12 +17,13 @@ import (
 
 func (r *runner) author(ctx context.Context) error {
 	text, runErr := r.claude(ctx)
-	// Claude and its descendants have exited. Give preservation its own
-	// budget so a cancelled run can still publish its unfinished work.
+	// Claude and its descendants have exited. Preservation always gets its own
+	// budget so a cancelled run can still publish its unfinished work, and so
+	// the shutdown report below keeps its 30s even if preservation is slow.
 	preserveCtx, preserveCancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
 	pushed, checkpoint, preserveErr := r.preserveAuthor(preserveCtx)
 	preserveCancel()
-	ctx, cancel, runErr := interrupted(ctx, runErr, 30*time.Second)
+	ctx, cancel, runErr := shutdownBudget(ctx, runErr, 30*time.Second)
 	defer cancel()
 	if preserveErr != nil {
 		return errors.Join(runErr, preserveErr, r.block(ctx, "Could not publish unfinished author work; the local checkout was retained: "+r.redact(preserveErr.Error())))
@@ -32,6 +33,7 @@ func (r *runner) author(ctx context.Context) error {
 		if pushed == "" {
 			reason += " No commits were made on " + r.payload.Branch + "."
 		} else {
+			// The dispatcher selects its resume prompt from the pushed branch.
 			reason += " Unfinished work is on " + r.payload.Branch + " at " + pushed + "; moving the card to To Do resumes it from GitHub."
 		}
 		if checkpoint {
@@ -58,26 +60,31 @@ func (r *runner) author(ctx context.Context) error {
 	return r.outcome(ctx, "succeeded")
 }
 
-// A cancelled run still owes cleanup and a terminal report, or the dispatcher
-// mistakes the exited worker for active work. Replace the cancelled context
-// with one bounded by budget, which must fit the pod's termination grace
-// period, and fold the cancellation into runErr unless Claude already
-// returned it. An uncancelled run keeps its caller's budget, including
-// dispatcher rate-limit waits.
-func interrupted(ctx context.Context, runErr error, budget time.Duration) (context.Context, context.CancelFunc, error) {
+// shutdownBudget replaces a cancelled ctx with one bounded by budget, so the
+// cleanup and terminal report that follow a run still happen; otherwise the
+// dispatcher mistakes the exited worker for active work. A run that itself
+// succeeded gets the cancellation as its error, so it is never reported as
+// success. An uncancelled run keeps its caller's context and budget,
+// including dispatcher rate-limit waits.
+//
+// The session pod's preStop hook (homelab) sends SIGTERM and waits for the
+// worker's lock inside a 180s termination grace period. Every budget a stage
+// spends after cancellation, in sequence, must fit inside it.
+func shutdownBudget(ctx context.Context, runErr error, budget time.Duration) (context.Context, context.CancelFunc, error) {
 	if ctx.Err() == nil {
 		return ctx, func() {}, runErr
 	}
-	if !errors.Is(runErr, ctx.Err()) {
-		runErr = errors.Join(runErr, ctx.Err())
+	if runErr == nil {
+		runErr = ctx.Err()
 	}
 	bounded, cancel := context.WithTimeout(context.WithoutCancel(ctx), budget)
 	return bounded, cancel, runErr
 }
 
-// preserveAuthor checkpoints only the commanded branch and returns the head
-// it pushed, or "" when the branch holds nothing beyond its base. Never
-// publish a different checkout or force away work that another actor pushed.
+// preserveAuthor checkpoints only the commanded branch. pushed is the head it
+// published, or "" when the branch holds nothing beyond its base; checkpoint
+// reports whether uncommitted work was first committed as a `stash:` commit.
+// Never publish a different checkout or force away work another actor pushed.
 func (r *runner) preserveAuthor(ctx context.Context) (pushed string, checkpoint bool, err error) {
 	branch, err := r.git(ctx, "symbolic-ref", "--quiet", "HEAD")
 	if err != nil {
@@ -102,21 +109,21 @@ func (r *runner) preserveAuthor(ctx context.Context) (pushed string, checkpoint 
 	}
 	ahead, err := r.git(ctx, "rev-list", "--count", r.payload.BaseSHA+".."+ref)
 	if err != nil {
-		return "", checkpoint, err
+		return "", false, err
 	}
 	count, err := strconv.Atoi(ahead)
 	if err != nil || count < 0 {
-		return "", checkpoint, fmt.Errorf("invalid authored commit count %q", ahead)
+		return "", false, fmt.Errorf("invalid authored commit count %q", ahead)
 	}
 	if count == 0 {
 		return "", checkpoint, nil
 	}
 	head, err := r.git(ctx, "rev-parse", ref)
 	if err != nil {
-		return "", checkpoint, err
+		return "", false, err
 	}
 	if _, err := r.git(ctx, "push", "-u", "origin", ref+":"+ref); err != nil {
-		return "", checkpoint, fmt.Errorf("preserve authored commits: %w", err)
+		return "", false, fmt.Errorf("preserve authored commits: %w", err)
 	}
 	return head, checkpoint, nil
 }
@@ -148,22 +155,25 @@ func (r *runner) authoredPR(ctx context.Context) (authoredPullRequest, error) {
 
 func (r *runner) test(ctx context.Context) (resultErr error) {
 	text, runErr := r.claude(ctx)
-	// Scratch left by a cancelled run would hold every later checkout.
-	ctx, cancel, runErr := interrupted(ctx, runErr, 2*time.Minute)
+	ctx, cancel, runErr := shutdownBudget(ctx, runErr, 90*time.Second)
 	defer cancel()
 	if err := r.verifyHead(ctx); err != nil {
 		return errors.Join(err, r.block(ctx, "The test checkout changed; its verdict was refused."))
 	}
 	// checkout required a clean tree, so this removes only this test run's
 	// scratch work. Never reset a different commit or the author/reviewer tree.
+	// Scratch left behind would hold every later checkout, so the reset gets
+	// its own budget rather than whatever reporting leaves of a shutdown's.
 	defer func() {
-		if err := r.verifyHead(ctx); err != nil {
+		cleanCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		if err := r.verifyHead(cleanCtx); err != nil {
 			resultErr = errors.Join(resultErr, err)
 			return
 		}
-		_, err := r.git(ctx, "reset", "--hard", "--quiet", r.payload.HeadSHA)
+		_, err := r.git(cleanCtx, "reset", "--hard", "--quiet", r.payload.HeadSHA)
 		if err == nil {
-			_, err = r.git(ctx, "clean", "-qfd")
+			_, err = r.git(cleanCtx, "clean", "-qfd")
 		}
 		resultErr = errors.Join(resultErr, err)
 	}()

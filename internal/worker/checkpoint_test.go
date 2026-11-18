@@ -100,9 +100,12 @@ func TestAuthorCheckpointsUnfinishedWork(t *testing.T) {
 				if remoteHead != r.payload.BaseSHA || localHead == remoteHead || !strings.Contains(got[0].Message, "Could not publish") {
 					t.Fatal("failed push lost local checkpoint or claimed success")
 				}
-			} else if remoteHead != localHead {
+				return
+			}
+			if remoteHead != localHead {
 				t.Fatal("checkpoint not pushed")
-			} else if !strings.Contains(got[0].Message, r.payload.Branch+" at "+remoteHead) {
+			}
+			if !strings.Contains(got[0].Message, r.payload.Branch+" at "+remoteHead) {
 				t.Fatalf("pushed checkpoint not reported: %q", got[0].Message)
 			}
 		})
