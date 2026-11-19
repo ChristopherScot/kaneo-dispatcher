@@ -98,6 +98,9 @@ func (r *runner) preserveAuthor(ctx context.Context) (pushedSHA string, checkpoi
 	if branch != ref {
 		return "", false, fmt.Errorf("author checkout changed to %q; checkpoint held", branch)
 	}
+	if err := r.checkCheckpointPaths(ctx); err != nil {
+		return "", false, err
+	}
 	dirty, err := r.git(ctx, "status", "--porcelain", "--untracked-files=all")
 	if err != nil {
 		return "", false, err
@@ -185,6 +188,11 @@ func (r *runner) test(ctx context.Context) (resultErr error) {
 	if verdictErr != nil || runErr != nil {
 		verdict = "BLOCKED"
 	}
+	// The CLI may time out before emitting any JSON output. Carry the cause
+	// into both reports rather than publishing an empty quoted string.
+	if cause := errors.Join(runErr, verdictErr); cause != nil {
+		text += "\nTest execution did not complete: " + cause.Error()
+	}
 	state := map[string]string{"PASS": "success", "FAIL": "failure", "BLOCKED": "error"}[verdict]
 	if err := r.gh(ctx, nil, "api", "--method", "POST", "repos/"+r.cfg.Repo+"/statuses/"+r.payload.HeadSHA,
 		"-f", "state="+state, "-f", "context=nightly/integration", "-f", "description=integration test: "+verdict); err != nil {
@@ -213,13 +221,8 @@ func (r *runner) test(ctx context.Context) (resultErr error) {
 	case "FAIL":
 		return r.rework(ctx, "Integration testing failed on "+r.payload.HeadSHA+"; see the pull request report.")
 	default:
-		reason := "Integration testing could not complete on " + r.payload.HeadSHA + "; see the pull request report."
-		for _, cause := range []error{runErr, verdictErr} {
-			if cause != nil {
-				reason += "\n" + r.redact(cause.Error())
-			}
-		}
-		return errors.Join(runErr, r.block(ctx, reason))
+		reason := "Integration testing could not complete on " + r.payload.HeadSHA + ".\n\n" + r.evidence(text)
+		return errors.Join(runErr, verdictErr, r.block(ctx, reason))
 	}
 }
 
@@ -251,9 +254,14 @@ func (r *runner) testLabel(ctx context.Context, verdict string) error {
 		return err
 	}
 	args := []string{"pr", "edit", strconv.Itoa(r.payload.PR), "--repo", r.cfg.Repo, "--add-label", want}
-	for _, label := range []string{"tested-pass", "tested-fail", "tested-blocked"} {
-		if label != want {
-			args = append(args, "--remove-label", label)
+	var pr struct{ Labels []struct{ Name string } }
+	if err := r.gh(ctx, &pr, "pr", "view", strconv.Itoa(r.payload.PR), "--repo", r.cfg.Repo, "--json", "labels"); err != nil {
+		return err
+	}
+	// gh rejects removal of a label that does not exist in this repository.
+	for _, label := range pr.Labels {
+		if label.Name != want && (label.Name == "tested-pass" || label.Name == "tested-fail" || label.Name == "tested-blocked") {
+			args = append(args, "--remove-label", label.Name)
 		}
 	}
 	return r.gh(ctx, nil, args...)

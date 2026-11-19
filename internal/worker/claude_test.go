@@ -160,6 +160,7 @@ func TestClaudeLoginAndModelFallback(t *testing.T) {
 	r, _ := claudeFixture(t, `
 [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] || exit 10
 [ -z "${ANTHROPIC_API_KEY:-}" ] || exit 11
+[ "${CLAUDE_CODE_DISABLE_BACKGROUND_TASKS:-}" = 1 ] || exit 13
 input=$(cat)
 if [ "$input" = 'Reply with exactly: OK' ]; then
  printf '%s' '{"type":"result","is_error":true,"api_error_status":404,"result":"model is unavailable"}'; exit 1
@@ -171,6 +172,7 @@ printf '%s' '{"type":"result","is_error":false,"result":"login fallback succeede
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("ANTHROPIC_API_KEY", "should-not-be-used")
+	t.Setenv("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "0")
 	if err := os.Mkdir(filepath.Join(home, ".claude"), 0700); err != nil {
 		t.Fatal(err)
 	}

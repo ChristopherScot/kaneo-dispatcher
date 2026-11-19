@@ -68,7 +68,7 @@ func TestAuthorReportsReasonBeforeNoPROutcome(t *testing.T) {
 	r, reports := stageFixture(t, "author", `printf '%s' '{"type":"result","is_error":false,"result":"OBSOLETE: the code already implements this"}'`, nil)
 	stageTool(t, r, "git", `case "$1" in
  symbolic-ref) printf refs/heads/fix/t1 ;;
- status) ;;
+ status|diff|ls-files|log) ;;
  rev-list) printf 0 ;;
  *) exit 1 ;;
 esac`)
@@ -90,25 +90,50 @@ esac`)
 }
 
 func TestFailedTestProcessCannotPublishPass(t *testing.T) {
-	r, reports := stageFixture(t, "test", `printf PASS > "$STAGE_ARCHIVE/verdict.txt"
+	for _, tc := range []struct{ name, script, reason string }{
+		{"failed-exit", `printf PASS > "$STAGE_ARCHIVE/verdict.txt"
 printf '%s' '{"type":"result","is_error":false,"result":"incomplete"}'
-exit 2`, nil)
-	stageTool(t, r, "git", `if [ "$1" = rev-parse ]; then printf head; fi`)
-	stageTool(t, r, "gh", `printf '{}'`)
-	if err := r.test(t.Context()); err == nil {
-		t.Fatal("failed Claude process lost its error")
-	}
-	got := reports()
-	if len(got) != 2 || got[0].Event != "note" || got[1].Event != "test-blocked" {
-		t.Fatalf("abnormal outcome: %+v", got)
-	}
-	raw, err := os.ReadFile(filepath.Join(r.dir, "tools.log"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	log := string(raw)
-	if !strings.Contains(log, "state=error") || strings.Contains(log, "state=success") || !strings.Contains(log, "git clean -qfd") {
-		t.Fatalf("incorrect status or missing cleanup: %s", log)
+exit 2`, "exit status 2"},
+		{"timeout-after-verdict", `printf PASS > "$STAGE_ARCHIVE/verdict.txt"
+sleep 30`, "context deadline exceeded"},
+		{"invalid-verdict", `printf MAYBE > "$STAGE_ARCHIVE/verdict.txt"
+printf '%s' '{"type":"result","is_error":false,"result":"finished"}'`, "invalid test verdict"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, reports := stageFixture(t, "test", tc.script, nil)
+			r.payload.TimeoutSeconds = 1
+			stageTool(t, r, "git", `if [ "$1" = rev-parse ]; then printf head; fi`)
+			stageTool(t, r, "gh", `case "$*" in
+ 'pr view '*) printf '%s' '{"labels":[{"name":"tested-fail"},{"name":"bug"}]}' ;;
+ 'pr comment '*)
+  for arg; do body=$arg; done
+  printf '%s' "$body" > "$STAGE_ARCHIVE/comment.txt"
+  ;;
+ 'pr edit '*)
+  case "$*" in *'--remove-label tested-pass'*|*'--remove-label bug'*) exit 9;; esac
+  ;;
+ *) printf '{}' ;;
+esac`)
+			if err := r.test(t.Context()); err == nil {
+				t.Fatal("failed test lost its error")
+			}
+			got := reports()
+			if len(got) != 2 || got[0].Event != "note" || got[1].Event != "test-blocked" || !strings.Contains(got[0].Message, tc.reason) {
+				t.Fatalf("abnormal outcome or missing reason: %+v", got)
+			}
+			raw, err := os.ReadFile(filepath.Join(r.dir, "tools.log"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			log := string(raw)
+			if !strings.Contains(log, "state=error") || strings.Contains(log, "state=success") || !strings.Contains(log, "git clean -qfd") || !strings.Contains(log, "--remove-label tested-fail") {
+				t.Fatalf("incorrect status, label, or missing cleanup: %s", log)
+			}
+			comment, err := os.ReadFile(filepath.Join(r.archive, "comment.txt"))
+			if err != nil || !strings.Contains(string(comment), tc.reason) {
+				t.Fatalf("PR comment lost failure cause: %s, %v", comment, err)
+			}
+		})
 	}
 }
 
