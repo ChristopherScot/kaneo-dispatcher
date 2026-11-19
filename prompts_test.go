@@ -22,7 +22,7 @@ func TestPromptSnapshotSurvivesChangesAndRejectsStaleStart(t *testing.T) {
 	f.kaneo.tasks["t1"]["description"] = "edited later"
 	f.kaneo.activity["t1"] = f.kaneo.activity["t1"][:2]
 	// Fetch through a new dispatcher object; no template or Kaneo reread occurs.
-	replacement := &dispatcher{apiKey: f.d.apiKey, workflows: f.d.workflows}
+	replacement := &dispatcher{owner: f.d.owner, apiKey: f.d.apiKey, workflows: f.d.workflows}
 	request := func(id string, authorized bool) *httptest.ResponseRecorder {
 		raw, _ := json.Marshal(map[string]any{"version": 1, "task": "t1", "command": id})
 		req := httptest.NewRequest(http.MethodPost, "/worker-command", bytes.NewReader(raw))

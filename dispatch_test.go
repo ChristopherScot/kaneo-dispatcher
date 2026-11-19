@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"io"
-	"maps"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -166,7 +165,6 @@ func TestEachColumnRoutesToItsOwnPod(t *testing.T) {
 	} {
 		t.Run(tc.column, func(t *testing.T) {
 			f := newFixture(t)
-			f.d.repos = nil // every pod works every repo here
 			f.kaneo.labels["t"] = []string{"repo:testrepo"}
 			if tc.column != "to-do" {
 				pr := openPR("abc")[0]
@@ -226,17 +224,16 @@ func TestUnansweredBusyProbeReportsAnError(t *testing.T) {
 
 }
 
-func TestPodThatDoesNotWorkTheRepoIsSkipped(t *testing.T) {
+func TestOutsideOwnerRepoIsSkipped(t *testing.T) {
 	f := newFixture(t)
-	f.kaneo.labels["t2"] = []string{"repo:elsewhere"}
+	f.kaneo.labels["t2"] = []string{"repo:Other/elsewhere"}
 	f.signed("/", move("t2", "to-do"))
 	// A skipped card must not wake the set either: a skip costs nothing.
 	f.wantUntouched()
-	f.wantLog(`card="t2: claude-session-0 does not work TestOwner/elsewhere"`)
+	f.wantLog("outside allowed owner TestOwner/*")
 }
 
-// A short label resolves under the owner once, in repoForTask, so the
-// pod's list and the GitHub lookup see the same owner/name.
+// Short labels resolve under the configured owner before authorization.
 func TestRepoLabelResolvesToOwnerAndName(t *testing.T) {
 	f := newFixture(t)
 	f.kaneo.labels["short"] = []string{"repo:alpha"}
@@ -249,37 +246,28 @@ func TestRepoLabelResolvesToOwnerAndName(t *testing.T) {
 	}
 }
 
-func TestRepoListIsMatchedByFullName(t *testing.T) {
-	d := &dispatcher{repos: map[string][]string{
-		"0": {"TestOwner/alpha", "TestOwner/beta", "Other/gamma"},
-		"1": {},
-	}}
-	pod := func(n int) stage { return stage{ordinal: n} }
+func TestRepositoryScopeAllowsNewReposUnderExactOwner(t *testing.T) {
+	d := &dispatcher{owner: "ChristopherScot"}
 	for repo, want := range map[string]bool{
-		"TestOwner/alpha": true,
-		"TestOwner/beta":  true,
-		"Other/gamma":     true,
-		"TestOwner/delta": false,
+		"ChristopherScot/new-repo":         true,
+		"christopherscot/kaneo-dispatcher": true,
+		"ChristopherScot/.github":          true,
+		"schoolhouse-world/app":            false,
+		"ChristopherScot-other/repo":       false,
+		"Other/ChristopherScot":            false,
+		"ChristopherScot/":                 false,
+		"ChristopherScot/..":               false,
+		"ChristopherScot/.":                false,
+		"ChristopherScot/../Other/repo":    false,
+		"ChristopherScot/repo?x=y":         false,
+		"ChristopherScot/*":                false,
 	} {
-		if got := d.podWorksRepo(pod(0), repo); got != want {
-			t.Errorf("podWorksRepo(pod0, %q) = %v, want %v", repo, got, want)
+		if got := d.repositoryAllowed(repo); got != want {
+			t.Errorf("repositoryAllowed(%q)=%v, want %v", repo, got, want)
 		}
 	}
-	// No list for this ordinal is not a reason to refuse; an empty one is.
-	if !d.podWorksRepo(pod(2), "TestOwner/alpha") {
-		t.Error("a pod with no list refused work")
-	}
-	if d.podWorksRepo(pod(1), "TestOwner/alpha") {
-		t.Error("a pod with an empty list accepted work")
-	}
-}
-
-func TestReposComeFromTheEnvironmentByOrdinal(t *testing.T) {
-	environ := []string{"PATH=/bin", "REPOS_POD0=a/b", "REPOS_POD2=c/d, e/f\ng/h", "REPOS=ignored", "NOEQUALS"}
-	got := reposFromEnv(environ)
-	want := map[string][]string{"0": {"a/b"}, "2": {"c/d", "e/f", "g/h"}}
-	if !maps.EqualFunc(got, want, slices.Equal) {
-		t.Errorf("reposFromEnv(%q) = %v, want %v", environ, got, want)
+	if (&dispatcher{}).repositoryAllowed("ChristopherScot/repo") {
+		t.Fatal("missing owner allowed work")
 	}
 }
 

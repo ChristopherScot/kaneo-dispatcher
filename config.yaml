@@ -26,6 +26,7 @@ image:
 
 env:
     DISPATCH_NS: claude-pods
+    NIGHTLY_OWNER: ChristopherScot
     RECONCILE_STALE: 4h
     RECONCILE_UNCLAIMED: 15m
     # In-cluster Service, not the ingress: cluster DNS does not resolve
@@ -34,8 +35,7 @@ env:
     KANEO_API_URL: http://kaneo.kaneo.svc.cluster.local:5173
     # The claude-pods board, which is what the reconcile sweep reads.
     # Named here so this file says which board the deployment serves;
-    # the owner and branch prefix are the same conventions the nightly
-    # scripts default to, and are left to the code's matching defaults.
+    # the branch prefix keeps the default used by the workers.
     KANEO_PROJECT_ID: pwz0urubiajnchag39tcbjkl
 
 # Everything the dispatcher reads from Vault, in one place. The policy
@@ -45,7 +45,6 @@ env:
 #   webhook-secret  verifies Kaneo's HMAC on every delivery
 #   api-key         reads a card's labels and, for the sweep, the board
 #   git/token       asks GitHub whether a card's work already exists
-#   repos/pod<n>    which repos each session pod works, by ordinal
 #
 # The properties are named for what they are, not for the variable, so
 # the path is not repeated: claude-pods/kaneo holds `api-key`, not
@@ -56,6 +55,7 @@ secrets:
         - KANEO_WEBHOOK_SECRET: webhook-secret
         - KANEO_API_KEY: api-key
         - GITHUB_TOKEN: claude-pods/git/token
+        # Keep these during rollout: older dispatcher images fail open without them.
         - REPOS_POD0: claude-pods/repos/pod0
         - REPOS_POD1: claude-pods/repos/pod1
         - REPOS_POD2: claude-pods/repos/pod2

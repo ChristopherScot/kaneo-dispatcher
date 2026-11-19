@@ -61,17 +61,14 @@ func (d *dispatcher) snapshotPrompt(ctx context.Context, id, repo, stage string)
 			}
 		}
 	}
-	var repository struct {
-		DefaultBranch string `json:"default_branch"`
-	}
-	if err := d.github(ctx, "/repos/"+repo, &repository); err != nil {
+	repository, err := d.ownedRepository(ctx, repo)
+	if err != nil {
 		return nil, err
 	}
 	if repository.DefaultBranch == "" {
 		return nil, fmt.Errorf("repository has no default branch")
 	}
 	payload.Base = repository.DefaultBranch
-	var err error
 	payload.BaseSHA, err = d.branchSHA(ctx, repo, payload.Base)
 	if err != nil {
 		return nil, err
@@ -210,12 +207,19 @@ func (d *dispatcher) workerPrompt(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "command has no available prompt", 409)
 		return
 	}
+	if err := d.requireRepository(command.Repo); err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	_ = json.NewEncoder(w).Encode(protocol.Command{Version: protocol.Version, Task: request.Task, Command: command.ID, Repo: command.Repo, Stage: command.Stage, Prompt: *command.Prompt})
 }
 
 func (d *dispatcher) validatePromptStart(ctx context.Context, command *workerCommand, suppliedDigest string) error {
+	if _, err := d.ownedRepository(ctx, command.Repo); err != nil {
+		return err
+	}
 	if command.Prompt == nil {
 		return nil
 	} // pre-upgrade command already in flight

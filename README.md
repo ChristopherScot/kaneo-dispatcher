@@ -22,7 +22,8 @@ step with the column graph written down in
 3. The shared queue selects the next eligible card for each stage. Its
    `repo:<name>` label is read back from the Kaneo API - the
    payload carries no labels - resolved to `owner/name`, and checked
-   against the list of repos the target pod works (`REPOS_POD<n>`).
+   against `NIGHTLY_OWNER` (`ChristopherScot` in production). Every stage accepts
+   any repository under that exact GitHub owner, including new repositories.
 4. The `claude-session` StatefulSet is woken: scaled to one past the
    highest ordinal `routes` names and waited on until every pod is
    ready, bounded at ten minutes. The `session-sleep` CronJob in
@@ -69,6 +70,32 @@ after the command's stage, repository, dependencies and column visit are checked
 
 Historical work-start comments are still recognized during rollout. New workers
 report starts to the dispatcher rather than posting their own receipt comments.
+
+## Repository scope
+
+All worker stages operate on `ChristopherScot/*`, configured by `NIGHTLY_OWNER`.
+Short labels such as `repo:kaneo-dispatcher` resolve under that owner; explicit
+`repo:ChristopherScot/new-project` labels work too. Owner matching is exact and
+case-insensitive. Other owners and malformed repository slugs are refused. GitHub repository
+identity is rechecked before issuing/starting work and authorizing merges, so
+a transferred repository cannot inherit permission from its old label.
+There are no per-pod allowlists or unrestricted missing-list fallback.
+
+The dispatcher checks scope before scheduling, issuing commands, serving worker
+prompts, accepting starts, and authorizing merges/reverts. Workers clone a
+missing assigned repository after their start is authorized, using the existing
+GitHub credential. Existing checkouts must point at the assigned repository;
+other checkouts and local work are preserved. Startup clone lists are optional
+workspace preparation, not dispatch permissions. GitHub token permissions still
+apply, including access to private repositories.
+
+Roll out the updated worker binary before enabling the dispatcher policy: older
+workers expect pre-cloned repositories. The StatefulSets use partition 3, so
+verify the actual binary after an idle sleep/wake or controlled replacement;
+a new image reference alone does not upgrade existing workers. Legacy
+`REPOS_POD<n>` secret mappings remain during rollout because old dispatcher
+images fail open without them; the owner-scoped code ignores those values. No ticket or workflow FSM transitions
+change with this policy.
 
 ## Priority queues
 
