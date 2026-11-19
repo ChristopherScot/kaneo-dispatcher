@@ -244,7 +244,7 @@ func (s *stubGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case strings.Contains(r.URL.Path, "/compare/"):
 		_ = json.NewEncoder(w).Encode(map[string]int{"ahead_by": 1})
 	case strings.HasPrefix(r.URL.Path, "/repos/") && !strings.HasSuffix(r.URL.Path, "/pulls"):
-		_ = json.NewEncoder(w).Encode(map[string]string{"default_branch": "main"})
+		_ = json.NewEncoder(w).Encode(map[string]string{"default_branch": "main", "full_name": strings.TrimPrefix(r.URL.Path, "/repos/")})
 	case strings.HasSuffix(r.URL.Path, "/pulls"):
 		prs := s.prs[r.URL.Query().Get("head")]
 		if prs == nil {
@@ -322,7 +322,6 @@ func newFixture(t *testing.T) *fixture {
 		apiKey:       "testkey",
 		secret:       []byte(testSecret),
 		ghToken:      "ghtoken",
-		repos:        map[string][]string{"0": {"TestOwner/testrepo", "TestOwner/other"}, "2": {"TestOwner/testrepo"}},
 		stale:        4 * time.Hour,
 		unclaimed:    15 * time.Minute,
 		exec:         f.pods.exec,

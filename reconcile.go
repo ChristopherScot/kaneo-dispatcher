@@ -168,6 +168,9 @@ func (d *dispatcher) reconcileCard(ctx context.Context, column string, c card, d
 	if !ok {
 		return cardResult{skipped, c.name() + ": card needs exactly one repo: label"}, nil
 	}
+	if err := d.requireRepository(repo); err != nil {
+		return cardResult{skipped, c.name() + ": " + err.Error()}, nil
+	}
 	pr, err := d.mergedWork(ctx, c.ID)
 	if err != nil {
 		return cardResult{}, err
@@ -235,9 +238,6 @@ func (d *dispatcher) reconcileCard(ctx context.Context, column string, c card, d
 	}
 	// The stage owns resume/rework policy. A PR or integration status may
 	// exist even though its corresponding board transition never happened.
-	if !d.podWorksRepo(st, repo) {
-		return cardResult{skipped, c.name() + ": " + st.pod() + " does not work " + repo}, nil
-	}
 	line := fmt.Sprintf("%s (%s, %dh)", c.name(), column, int(age.Hours()))
 	priority, err := priorityRank(c.Priority)
 	if err != nil {

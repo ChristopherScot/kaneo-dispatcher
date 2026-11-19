@@ -36,6 +36,7 @@ func TestDirtyCheckoutPreservedAndReportedBlocked(t *testing.T) {
 				return string(out)
 			}
 			git("init", "-q", "--initial-branch=main")
+			git("remote", "add", "origin", "https://github.com/owner/repo.git")
 			file := filepath.Join(dir, "unfinished.txt")
 			if err := os.WriteFile(file, []byte("preserve this work\n"), 0600); err != nil {
 				t.Fatal(err)

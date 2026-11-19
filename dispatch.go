@@ -12,12 +12,11 @@ import (
 	"net/url"
 	"os"
 	"path"
-	"slices"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
-	"unicode"
 
 	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 )
@@ -82,7 +81,7 @@ type waker func(ctx context.Context) error
 // the Secret behind them changes, so a rotated credential reaches a
 // running pod by replacing it.
 type dispatcher struct {
-	owner        string // GitHub owner a short repo: label resolves under
+	owner        string // GitHub owner allowed for all worker stages
 	branchPrefix string // a stage branches from the task id; the sweep looks it up
 	project      string // the Kaneo project the sweep reads
 	kaneoURL     string
@@ -90,9 +89,8 @@ type dispatcher struct {
 	apiKey       string // Kaneo: reads a card's labels, and the board
 	secret       []byte // the HMAC key Kaneo signs deliveries with
 	ghToken      string
-	repos        map[string][]string // pod ordinal -> the owner/name repos it works
-	stale        time.Duration       // grace period after a worker starts
-	unclaimed    time.Duration       // retry delay when no worker has started
+	stale        time.Duration // grace period after a worker starts
+	unclaimed    time.Duration // retry delay when no worker has started
 	workflows    typedcorev1.ConfigMapInterface
 	kaneoLimit   kaneoCooldown
 	sweepMu      sync.Mutex // prevent overlapping asynchronous sweeps
@@ -154,7 +152,6 @@ func fromEnv() (*dispatcher, error) {
 		// Legacy standalone webhooks can launch without GitHub access.
 		// Workflow dependency/completion gates fail closed if it is unavailable.
 		ghToken:   os.Getenv("GITHUB_TOKEN"),
-		repos:     reposFromEnv(os.Environ()),
 		stale:     stale,
 		unclaimed: unclaimed,
 		exec:      exec,
@@ -169,24 +166,6 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
-}
-
-// reposFromEnv reads REPOS_POD<n> into lists keyed by <n>. The variables
-// come from the Vault-backed secret, one per session pod, as the same
-// comma or whitespace separated owner/name list the pods themselves read.
-func reposFromEnv(environ []string) map[string][]string {
-	isSep := func(c rune) bool { return c == ',' || unicode.IsSpace(c) }
-	out := map[string][]string{}
-	for _, kv := range environ {
-		k, v, ok := strings.Cut(kv, "=")
-		if !ok {
-			continue
-		}
-		if n, found := strings.CutPrefix(k, "REPOS_POD"); found {
-			out[n] = strings.FieldsFunc(v, isSep)
-		}
-	}
-	return out
 }
 
 // card is a task as both the webhook and the board describe it.
@@ -285,6 +264,9 @@ var (
 
 // runStage wakes the pods, rechecks the card and waits for worker acceptance.
 func (d *dispatcher) runStage(ctx context.Context, repo string, st stage, c card, column string) error {
+	if err := d.requireRepository(repo); err != nil {
+		return err
+	}
 	if err := d.workflowGate(ctx, c.ID); err != nil {
 		return err
 	}
@@ -377,25 +359,37 @@ func (d *dispatcher) podIsBusy(ctx context.Context, pod string) (bool, error) {
 	}
 }
 
-// podWorksRepo reports whether a pod works this repo at all.
-//
-// routes picks a pod by column, but which repos a pod acts on is decided
-// separately, by the per-pod list the session pods themselves read.
-// Dispatching a repo that is not on that list runs a full job that scans
-// the wrong set and exits having done nothing - a silent no-op that reads
-// as a successful run. Checking here turns that into one line saying why.
-//
-// A pod with no list at all is refused nothing: the scripts filter by
-// repo themselves, so this check only buys the better log line, and a
-// missing entry says the operator has not opted that pod in rather than
-// that it works nothing. An entry that is present but empty does mean
-// "works nothing", and refuses everything.
-func (d *dispatcher) podWorksRepo(st stage, repo string) bool {
-	list, ok := d.repos[strconv.Itoa(st.ordinal)]
-	if !ok {
-		return true
+var repositorySlug = regexp.MustCompile(`^[A-Za-z0-9-]+/[A-Za-z0-9_.-]+$`)
+
+func (d *dispatcher) repositoryAllowed(repo string) bool {
+	owner, name, ok := strings.Cut(repo, "/")
+	return ok && d.owner != "" && strings.EqualFold(owner, d.owner) && repositorySlug.MatchString(repo) && name != "." && name != ".."
+}
+
+func (d *dispatcher) requireRepository(repo string) error {
+	if !d.repositoryAllowed(repo) {
+		return blocked("repository %q is outside allowed owner %s/*", repo, d.owner)
 	}
-	return slices.Contains(list, repo)
+	return nil
+}
+
+type repositoryInfo struct {
+	FullName      string `json:"full_name"`
+	DefaultBranch string `json:"default_branch"`
+}
+
+func (d *dispatcher) ownedRepository(ctx context.Context, repo string) (repositoryInfo, error) {
+	var info repositoryInfo
+	if err := d.requireRepository(repo); err != nil {
+		return info, err
+	}
+	if err := d.github(ctx, "/repos/"+repo, &info); err != nil {
+		return info, err
+	}
+	if !strings.EqualFold(info.FullName, repo) {
+		return info, blocked("repository identity changed; update the task label")
+	}
+	return info, nil
 }
 
 // repoForTask is the repo a card is for, as owner/name, from its

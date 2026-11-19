@@ -66,6 +66,9 @@ func readCommand(cm *corev1.ConfigMap, id string) (*workerCommand, error) {
 }
 
 func (d *dispatcher) issueCommand(ctx context.Context, id, repo, column string, st stage, work workState) (*workerCommand, error) {
+	if err := d.requireRepository(repo); err != nil {
+		return nil, err
+	}
 	if !newTicketFSM(column).Can(strings.TrimPrefix(path.Base(st.script), "stage-") + "-started") {
 		return nil, fmt.Errorf("stage cannot start in %s", column)
 	}
@@ -297,6 +300,11 @@ func (d *dispatcher) acceptReportAttempt(ctx context.Context, report workerRepor
 	if report.Event != "note" && report.Event != "link" && !strings.HasPrefix(report.Event, command.Stage+"-") {
 		return blocked("event does not belong to commanded stage")
 	}
+	if strings.HasSuffix(report.Event, "-started") {
+		if err := d.requireRepository(command.Repo); err != nil {
+			return err
+		}
+	}
 	task, err := d.workflowTask(ctx, report.Task)
 	if err != nil {
 		return err
@@ -510,6 +518,9 @@ func (d *dispatcher) workerArtifact(ctx context.Context, report workerReport) er
 }
 
 func (d *dispatcher) authorizeGitHub(ctx context.Context, cm *corev1.ConfigMap, report workerReport, command *workerCommand) error {
+	if err := d.requireRepository(command.Repo); err != nil {
+		return err
+	}
 	if report.Event == "merge-authorize" && command.Phase != "running" {
 		return blocked("merge command is not running")
 	}
@@ -523,10 +534,8 @@ func (d *dispatcher) authorizeGitHub(ctx context.Context, cm *corev1.ConfigMap, 
 	if pr == nil || report.PR <= 0 || pr.Number != report.PR || report.SHA == "" || pr.Head.SHA != report.SHA {
 		return blocked("PR or reviewed head changed")
 	}
-	var repository struct {
-		DefaultBranch string `json:"default_branch"`
-	}
-	if err := d.github(ctx, "/repos/"+command.Repo, &repository); err != nil {
+	repository, err := d.ownedRepository(ctx, command.Repo)
+	if err != nil {
 		return err
 	}
 	if repository.DefaultBranch == "" || pr.Base.Ref != repository.DefaultBranch || !strings.EqualFold(pr.Base.Repo.FullName, command.Repo) {
