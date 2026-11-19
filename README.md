@@ -196,6 +196,36 @@ model probing and account fallback; each attempt receives the same frozen
 prompt. Output and credential-redacted attempt records are bounded and archived.
 A nonzero exit or error result cannot produce a passing test/review verdict.
 Test verdict files live in the command archive, outside the repository.
+Worker Claude invocations set `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`, so a
+tool timeout stops the command instead of moving it into the background.
+Headless Claude otherwise waits for background jobs after its final answer,
+which can exhaust the worker deadline after a verdict has already been written.
+Testers must settle their processes before writing a verdict and must fail
+unmet ticket requirements even when a defect predates the PR. Execution and
+verdict errors appear in both the GitHub report and the dispatcher note.
+
+An author or test run cancelled while Claude is running (SIGTERM from the pod's
+preStop hook) still finishes inside a bounded budget: the author commits dirty
+work as a `stash:` checkpoint and pushes it, then reports blocked with the
+interruption reason; the test stage resets its scratch and reports blocked once
+its GitHub status and comment are posted. Neither exits silently. The author's
+note names the pushed branch and SHA; moving the card back to To Do resumes
+from GitHub. A failed push is reported as such and the local checkout is kept.
+Before staging or pushing, a conservative path check refuses known credential
+and runtime paths: `.env`/`.env.*` (except example/sample/template), credential
+dotfiles and key files, private tool directories, caches, `node_modules`,
+`.venv`, `.terraform`, `.nightly`, `books`, `downloads`, and `references`.
+It checks non-ignored new files, tracked changes, and authored commit history,
+including files deleted by a later commit. A refused checkpoint leaves the
+entire index, working tree, and local commits intact and reports the offending
+path. No remote recovery is promised until the private material is removed
+from unpublished history/index and local-only files are ignored. This is a
+path policy, not a secret scanner: repositories still need appropriate ignore
+rules, and credentials must never be embedded in source files.
+A cancellation that lands during the brief reporting tail is not budgeted; the
+stale timeout reclaims that command. A cancelled merge review reports nothing:
+the running command holds its slot until the stale timeout and is then
+reissued, and a merge already authorized stays held for explicit recovery.
 
 Merge authorization precedes a durable intent, then the exact-head GitHub merge
 request. The confirmed merge SHA is archived before any completion report.

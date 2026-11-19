@@ -17,26 +17,29 @@ import (
 
 func (r *runner) author(ctx context.Context) error {
 	text, runErr := r.claude(ctx)
-	// Claude and its descendants have exited. Give preservation its own
-	// budget so a cancelled run can still publish its unfinished work.
+	// Claude and its descendants have exited. Preservation always gets its own
+	// budget so a cancelled run can still publish its unfinished work, and so
+	// the shutdown report below keeps its own budget even if preservation is
+	// slow. Both run in sequence against the ceiling shutdownBudget documents.
 	preserveCtx, preserveCancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
-	checkpoint, preserveErr := r.preserveAuthor(preserveCtx)
+	pushedSHA, checkpoint, preserveErr := r.preserveAuthor(preserveCtx)
 	preserveCancel()
-	if ctx.Err() != nil {
-		runErr = errors.Join(runErr, ctx.Err())
-		// Normal reporting retains its HTTP budget, including dispatcher
-		// rate-limit waits. Only shutdown must fit the pod's grace period.
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-		defer cancel()
-	}
+	ctx, cancel, runErr := shutdownBudget(ctx, runErr, 30*time.Second)
+	defer cancel()
 	if preserveErr != nil {
 		return errors.Join(runErr, preserveErr, r.block(ctx, "Could not publish unfinished author work; the local checkout was retained: "+r.redact(preserveErr.Error())))
 	}
 	if checkpoint || runErr != nil {
-		reason := "Author execution did not complete. Recovery branch: " + r.payload.Branch + "."
-		if checkpoint {
-			reason += " Uncommitted changes were saved in a stash: checkpoint commit."
+		// The dispatcher selects its resume prompt from the pushed branch; the
+		// README tells the reader how to trigger that.
+		reason := "Author execution did not complete."
+		if pushedSHA == "" {
+			reason += " No commits were made on " + r.payload.Branch + "."
+		} else {
+			reason += " Unfinished work is on " + r.payload.Branch + " at " + pushedSHA + "."
+			if checkpoint {
+				reason += " Uncommitted changes were saved in a stash: checkpoint commit."
+			}
 		}
 		if runErr != nil {
 			reason += "\n" + r.redact(runErr.Error())
@@ -59,44 +62,77 @@ func (r *runner) author(ctx context.Context) error {
 	return r.outcome(ctx, "succeeded")
 }
 
-// preserveAuthor checkpoints only the commanded branch. Never publish a
-// different checkout or force away work that another actor has pushed.
-func (r *runner) preserveAuthor(ctx context.Context) (bool, error) {
+// shutdownBudget replaces a cancelled ctx with one bounded by budget, so the
+// cleanup and terminal report that follow a run still happen; otherwise the
+// dispatcher mistakes the exited worker for active work. runErr passes
+// through, except that a cancelled run which itself succeeded gets the
+// cancellation, so it is never reported as success. An uncancelled run keeps
+// its caller's context and budget, including dispatcher rate-limit waits.
+// Callers always call cancel.
+//
+// The session pod's preStop hook (homelab) sends SIGTERM and waits for the
+// worker's lock inside a 180s termination grace period. Every budget a stage
+// spends after cancellation, in sequence, must fit inside it.
+func shutdownBudget(ctx context.Context, runErr error, budget time.Duration) (bounded context.Context, cancel context.CancelFunc, _ error) {
+	if ctx.Err() == nil {
+		return ctx, func() {}, runErr
+	}
+	if runErr == nil {
+		runErr = ctx.Err()
+	}
+	bounded, cancel = context.WithTimeout(context.WithoutCancel(ctx), budget)
+	return bounded, cancel, runErr
+}
+
+// preserveAuthor checkpoints only the commanded branch. pushedSHA is the head
+// it published, or "" when the branch holds nothing beyond its base;
+// checkpoint reports whether uncommitted work was first committed as a
+// `stash:` commit, which always leaves something to push. Never publish a
+// different checkout or force away work another actor pushed.
+func (r *runner) preserveAuthor(ctx context.Context) (pushedSHA string, checkpoint bool, err error) {
 	branch, err := r.git(ctx, "symbolic-ref", "--quiet", "HEAD")
 	if err != nil {
-		return false, err
+		return "", false, err
 	}
 	ref := "refs/heads/" + r.payload.Branch
 	if branch != ref {
-		return false, fmt.Errorf("author checkout changed to %q; checkpoint held", branch)
+		return "", false, fmt.Errorf("author checkout changed to %q; checkpoint held", branch)
+	}
+	if err := r.checkCheckpointPaths(ctx); err != nil {
+		return "", false, err
 	}
 	dirty, err := r.git(ctx, "status", "--porcelain", "--untracked-files=all")
 	if err != nil {
-		return false, err
+		return "", false, err
 	}
-	checkpoint := dirty != ""
+	checkpoint = dirty != ""
 	if checkpoint {
 		if _, err := r.git(ctx, "add", "--all"); err != nil {
-			return false, err
+			return "", false, err
 		}
 		if _, err := r.git(ctx, "commit", "-m", "stash: unfinished work for "+r.cfg.Task+" ("+r.cfg.Command+")"); err != nil {
-			return false, err
+			return "", false, err
 		}
 	}
 	ahead, err := r.git(ctx, "rev-list", "--count", r.payload.BaseSHA+".."+ref)
 	if err != nil {
-		return checkpoint, err
+		return "", false, err
 	}
 	count, err := strconv.Atoi(ahead)
 	if err != nil || count < 0 {
-		return checkpoint, fmt.Errorf("invalid authored commit count %q", ahead)
+		return "", false, fmt.Errorf("invalid authored commit count %q", ahead)
 	}
-	if count > 0 {
-		if _, err := r.git(ctx, "push", "-u", "origin", ref+":"+ref); err != nil {
-			return checkpoint, fmt.Errorf("preserve authored commits: %w", err)
-		}
+	if count == 0 {
+		return "", false, nil
 	}
-	return checkpoint, nil
+	head, err := r.git(ctx, "rev-parse", ref)
+	if err != nil {
+		return "", false, err
+	}
+	if _, err := r.git(ctx, "push", "-u", "origin", ref+":"+ref); err != nil {
+		return "", false, fmt.Errorf("preserve authored commits: %w", err)
+	}
+	return head, checkpoint, nil
 }
 
 type authoredPullRequest struct {
@@ -126,25 +162,36 @@ func (r *runner) authoredPR(ctx context.Context) (authoredPullRequest, error) {
 
 func (r *runner) test(ctx context.Context) (resultErr error) {
 	text, runErr := r.claude(ctx)
+	ctx, cancel, runErr := shutdownBudget(ctx, runErr, 90*time.Second)
+	defer cancel()
 	if err := r.verifyHead(ctx); err != nil {
 		return errors.Join(err, r.block(ctx, "The test checkout changed; its verdict was refused."))
 	}
 	// checkout required a clean tree, so this removes only this test run's
 	// scratch work. Never reset a different commit or the author/reviewer tree.
+	// Scratch left behind would hold every later checkout, so the reset always
+	// gets its own budget rather than whatever reporting leaves of a shutdown's.
 	defer func() {
-		if err := r.verifyHead(ctx); err != nil {
+		cleanCtx, cleanCancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cleanCancel()
+		if err := r.verifyHead(cleanCtx); err != nil {
 			resultErr = errors.Join(resultErr, err)
 			return
 		}
-		_, err := r.git(ctx, "reset", "--hard", "--quiet", r.payload.HeadSHA)
+		_, err := r.git(cleanCtx, "reset", "--hard", "--quiet", r.payload.HeadSHA)
 		if err == nil {
-			_, err = r.git(ctx, "clean", "-qfd")
+			_, err = r.git(cleanCtx, "clean", "-qfd")
 		}
 		resultErr = errors.Join(resultErr, err)
 	}()
-	verdict, err := readTestVerdict(filepath.Join(r.archive, "verdict.txt"))
-	if err != nil || runErr != nil {
+	verdict, verdictErr := readTestVerdict(filepath.Join(r.archive, "verdict.txt"))
+	if verdictErr != nil || runErr != nil {
 		verdict = "BLOCKED"
+	}
+	// The CLI may time out before emitting any JSON output. Carry the cause
+	// into both reports rather than publishing an empty quoted string.
+	if cause := errors.Join(runErr, verdictErr); cause != nil {
+		text += "\nTest execution did not complete: " + cause.Error()
 	}
 	state := map[string]string{"PASS": "success", "FAIL": "failure", "BLOCKED": "error"}[verdict]
 	if err := r.gh(ctx, nil, "api", "--method", "POST", "repos/"+r.cfg.Repo+"/statuses/"+r.payload.HeadSHA,
@@ -174,7 +221,8 @@ func (r *runner) test(ctx context.Context) (resultErr error) {
 	case "FAIL":
 		return r.rework(ctx, "Integration testing failed on "+r.payload.HeadSHA+"; see the pull request report.")
 	default:
-		return errors.Join(runErr, r.block(ctx, "Integration testing could not complete on "+r.payload.HeadSHA+"; see the pull request report."))
+		reason := "Integration testing could not complete on " + r.payload.HeadSHA + ".\n\n" + r.evidence(text)
+		return errors.Join(runErr, verdictErr, r.block(ctx, reason))
 	}
 }
 
@@ -206,9 +254,14 @@ func (r *runner) testLabel(ctx context.Context, verdict string) error {
 		return err
 	}
 	args := []string{"pr", "edit", strconv.Itoa(r.payload.PR), "--repo", r.cfg.Repo, "--add-label", want}
-	for _, label := range []string{"tested-pass", "tested-fail", "tested-blocked"} {
-		if label != want {
-			args = append(args, "--remove-label", label)
+	var pr struct{ Labels []struct{ Name string } }
+	if err := r.gh(ctx, &pr, "pr", "view", strconv.Itoa(r.payload.PR), "--repo", r.cfg.Repo, "--json", "labels"); err != nil {
+		return err
+	}
+	// gh rejects removal of a label that does not exist in this repository.
+	for _, label := range pr.Labels {
+		if label.Name != want && (label.Name == "tested-pass" || label.Name == "tested-fail" || label.Name == "tested-blocked") {
+			args = append(args, "--remove-label", label.Name)
 		}
 	}
 	return r.gh(ctx, nil, args...)

@@ -168,7 +168,12 @@ func (r *runner) claudeAttempt(ctx context.Context, account claudeAccount, model
 	}
 	r.log.Printf("Claude %s: account=%s model=%s", attempt, account.name, model)
 	args := []string{"-p", "--output-format", "json", "--model", model, "--permission-mode", "acceptEdits", "--settings", r.cfg.Settings, "--add-dir", r.dir, "--add-dir", r.archive}
-	raw, processErr := process(ctx, r.lock, r.dir, input, toolEnv(account.token, r.ghToken), "claude", args...)
+	// Headless Claude waits for background jobs even after its final answer.
+	// Keep commanded work in the foreground: tool timeouts must stop the tool,
+	// not silently start a background build that outlives the stage's verdict.
+	env := toolEnv(account.token, r.ghToken)
+	env = append(env, "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1")
+	raw, processErr := process(ctx, r.lock, r.dir, input, env, "claude", args...)
 	errorText := ""
 	if processErr != nil {
 		errorText = redact(processErr.Error())
